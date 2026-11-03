@@ -144,6 +144,16 @@ default user. Every stock ISO has the same root password: change it before build
 - After installing, logged in as the EgOS user: `sudo passwd root` to set a new root password, or
   `sudo passwd -l root` to lock root (sudo keeps working).
 
+**WARNING: the setup Wi-Fi (default `SetupBox`) has a fixed, public default passphrase, `setup1234`. With a user
+chosen at first boot, anyone in Wi-Fi range can join it and create the user in your place until the form is sent.**
+
+- Set your own passphrase in the web app: **Accounts → Setup Wi-Fi** (8–63 characters, or **Generate**); the
+  Summary warns while the default is in use. A preset user skips the setup Wi-Fi altogether.
+- Do not change `setup1234` in `rootfs/usr/local/bin/setup-webapp.sh`: the web app replaces exactly that line
+  (checked anchor in `egobuilder/generator.py`) and would stop. For a stock ISO, do the first boot in a trusted
+  place or over Ethernet (**http://setupbox.local**) and send the form right away: after it the access point is
+  stopped and its configuration is deleted.
+
 ### Tested
 
 - CI: `make check`. `docker compose config` accepts the stack with all 15 apps plus a custom one.
