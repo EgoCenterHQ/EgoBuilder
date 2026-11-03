@@ -1,0 +1,10 @@
+.git
+.github
+.claude
+out
+**/__pycache__
+**/*.pyc
+*.iso
+*.img
+*.log
+egobuilder/test_generator.py

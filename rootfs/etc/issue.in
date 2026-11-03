@@ -1,0 +1,9 @@
+EgOS @EGOS_VERSION@ - Debian GNU/Linux 13 \n \l
+
+  Setup / web access: http://egocenter.local    IP: \4
+
+  Home page:     http://egocenter.local:8000
+  Admin console: https://egocenter.local:9090  (Storage pool page)
+  Storage:       storage-add / storage-status / storage-drain
+  Extras:        egos-extras list
+

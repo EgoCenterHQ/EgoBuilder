@@ -1,0 +1,155 @@
+#
+# egos stack: Immich (photos) + Jellyfin (media) + EgosHome (home page)
+# Requires Docker Compose v2 (docker-compose-plugin, official Docker repo)
+#
+# Based on Immich's OFFICIAL docker-compose.yml:
+# https://github.com/immich-app/immich/blob/main/docker/docker-compose.yml
+#
+
+name: egos
+
+services:
+
+  immich-server:
+    container_name: immich_server
+    image: ghcr.io/immich-app/immich-server:${IMMICH_VERSION:-release}
+    volumes:
+      - ${UPLOAD_LOCATION}:/data
+      - /etc/localtime:/etc/localtime:ro
+    env_file:
+      - .env
+    ports:
+      - '2283:2283'
+    depends_on:
+      - redis
+      - database
+    restart: always
+    healthcheck:
+      disable: false
+
+  immich-machine-learning:
+    container_name: immich_machine_learning
+    # For ML hardware acceleration: append -[armnn, cuda, rocm, openvino, rknn]
+    # to the image tag, e.g. ${IMMICH_VERSION:-release}-cuda
+    image: ghcr.io/immich-app/immich-machine-learning:${IMMICH_VERSION:-release}
+    volumes:
+      - model-cache:/cache
+    env_file:
+      - .env
+    restart: always
+    healthcheck:
+      disable: false
+
+  redis:
+    container_name: immich_redis
+    image: docker.io/valkey/valkey:9@sha256:8436e10bc65c94886a91d4415b6a6dfa9cb5a306fb3b996e5bb67cd2b4854193
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: always
+
+  database:
+    container_name: immich_postgres
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_DB: ${DB_DATABASE_NAME}
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      # WARNING (Immich docs): path on a local POSIX filesystem (ext4/zfs/xfs/btrfs),
+      # NEVER on an NFS/SMB network share.
+      - ${DB_DATA_LOCATION}:/var/lib/postgresql/data
+    shm_size: 128mb
+    restart: always
+    healthcheck:
+      disable: false
+
+  jellyfin:
+    image: jellyfin/jellyfin:${JELLYFIN_VERSION:-latest}
+    container_name: jellyfin
+    ports:
+      - 8096:8096/tcp
+      - 7358:7358/udp
+    volumes:
+      - ${JELLYFIN_CONFIG_LOCATION}:/config
+      - ${JELLYFIN_CACHE_LOCATION}:/cache
+      # paths consistent with the dir tree created by dirtree.sh
+      - type: bind
+        source: ${JELLYFIN_MEDIA_LOCATION}/Films
+        target: /Films
+      - type: bind
+        source: ${JELLYFIN_MEDIA_LOCATION}/Musics
+        target: /Musics
+      - type: bind
+        source: ${JELLYFIN_MEDIA_LOCATION}/SerieTv
+        target: /Serie
+        read_only: true
+      - type: bind
+        source: ${JELLYFIN_MEDIA_LOCATION}/ROMs
+        target: /ROMs
+        read_only: true
+      # pool gate: /run/egos/pool-ok exists only while every pool disk is present
+      # (egos-pool.service). create_host_path: false = docker must NOT create it
+      # (compose would otherwise pass it as a legacy bind, which docker creates):
+      # with a disk missing Jellyfin cannot start, not even docker's own restart
+      # at boot, so its library scan never sees missing titles
+      - type: bind
+        source: /run/egos/pool-ok
+        target: /egos-pool-ok
+        read_only: true
+        bind:
+          create_host_path: false
+    restart: 'unless-stopped'
+    environment:
+      - JELLYFIN_PublishedServerUrl=http://localhost:8096
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+
+  # EgosHome: home page with one card per container, read from Docker through
+  # docker-proxy, which allows ONLY GET /containers/json (egos-home/docker-proxy.cfg:
+  # no inspect = no environment variables, no logs, no POST)
+  docker-proxy:
+    container_name: egos-home-docker-proxy
+    image: docker.io/tecnativa/docker-socket-proxy:0.3.0
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./egos-home/docker-proxy.cfg:/usr/local/etc/haproxy/haproxy.cfg.template:ro
+    ports:
+      - '127.0.0.1:23750:2375'
+    # not read_only: the image writes its haproxy.cfg next to the template at start
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    labels:
+      - egos.home.enable=false
+    restart: unless-stopped
+
+  egos-home:
+    container_name: egos-home
+    image: docker.io/library/python:3.13-alpine
+    # host network: the port probes on 127.0.0.1 see the system's ports
+    network_mode: host
+    user: '1000:1000'
+    read_only: true
+    environment:
+      - PORT=8000
+      - FALLBACK_HOST=egocenter.local
+      - DOCKER_API=http://127.0.0.1:23750
+    volumes:
+      - ./egos-home/home.py:/app/home.py:ro
+      - ./egos-home/icons:/app/icons:ro
+    command: ['python', '-u', '/app/home.py']
+    depends_on:
+      - docker-proxy
+    labels:
+      - egos.home.enable=false
+    healthcheck:
+      test: ['CMD', 'python', '-c', "import os, urllib.request as u; u.urlopen('http://127.0.0.1:%s/health' % os.environ['PORT'], timeout=3)"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  model-cache:

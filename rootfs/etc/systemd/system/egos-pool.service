@@ -1,0 +1,17 @@
+[Unit]
+Description=EgOS storage pool (mergerfs on /srv/egos/pool)
+After=local-fs.target
+Before=docker.service smbd.service egos-pool-guard.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/egos-storage _pool
+ExecStartPost=/usr/local/sbin/egos-storage _pool-ready
+ExecStop=-/bin/umount /srv/egos/pool
+# 60s wait for slow USB disks + mount
+TimeoutStartSec=150
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

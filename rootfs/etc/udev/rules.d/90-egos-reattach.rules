@@ -1,0 +1,3 @@
+# EgOS: a partition labelled egos-data* (made by egos-storage add) appears ->
+# reattach it to the pool if it was missing (egos-storage _autoreattach decides)
+ACTION=="add", SUBSYSTEM=="block", ENV{DEVTYPE}=="partition", ENV{ID_FS_LABEL}=="egos-data*", TAG+="systemd", ENV{SYSTEMD_WANTS}+="egos-reattach.service"

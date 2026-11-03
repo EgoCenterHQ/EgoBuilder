@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+# cwd of binary hooks = inside binary/ (verified); fallback just in case
+[ -d isolinux ] || cd binary
+
+# ---- BIOS / isolinux ----
+if ! grep -q '^label installstart' isolinux/install.cfg; then
+    echo "ERROR 0500: label installstart not found, install.cfg:"; cat isolinux/install.cfg; exit 1
+fi
+sed -i '/^[[:space:]]*menu default[[:space:]]*$/d' isolinux/live.cfg
+sed -i '/^label installstart/a menu default' isolinux/install.cfg
+sed -i -E 's/^timeout .*/timeout 50/' isolinux/isolinux.cfg
+if ! grep -q '^timeout 50' isolinux/isolinux.cfg; then
+    echo "ERROR 0500: timeout not set, isolinux.cfg:"; cat isolinux/isolinux.cfg; exit 1
+fi
+echo "0500 BIOS ok: default=installstart, timeout 5s"
+
+# ---- UEFI / grub ----
+# NB: the title in install_start.cfg is in SINGLE quotes: quote-agnostic grep
+if ! grep -q 'menuentry .Start installer.' boot/grub/install_start.cfg; then
+    echo "ERROR 0500: different installer title, install_start.cfg:"; cat boot/grub/install_start.cfg; exit 1
+fi
+printf '\nset default="Start installer"\nset timeout=5\n' >> boot/grub/grub.cfg
+echo "0500 UEFI ok: default=Start installer, timeout 5s"

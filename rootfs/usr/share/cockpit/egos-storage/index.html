@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Storage pool</title>
+    <link rel="stylesheet" href="egos-storage.css">
+    <script src="../base1/cockpit.js"></script>
+    <script src="egos-storage.js"></script>
+</head>
+<body>
+<main class="page">
+    <header class="page-head">
+        <div>
+            <h1>Storage pool</h1>
+            <p class="muted">One pool (<code>/srv/egos/pool</code>) for media, photos and the Samba share. It starts on the system disk; every disk you add joins it without moving anything.</p>
+        </div>
+        <button id="btn-refresh" class="btn" type="button">Refresh</button>
+    </header>
+
+    <div id="banner-admin" class="banner warn" hidden>
+        <strong>Administrative access needed.</strong>
+        Click <em>Limited access</em> at the top right of Cockpit and enter your password to manage storage.
+    </div>
+    <div id="banner-error" class="banner danger" hidden></div>
+    <div id="banner-health" class="banner danger" hidden></div>
+
+    <div id="content" hidden>
+        <section class="card">
+            <div class="card-head">
+                <h2>Pool</h2>
+                <span id="pool-state" class="badge"></span>
+                <div class="spacer"></div>
+                <button id="btn-reattach" class="btn" type="button">Retry missing disks</button>
+            </div>
+            <div id="pool-usage" class="usage" hidden>
+                <div class="bar"><div id="pool-bar" class="bar-fill"></div></div>
+                <div id="pool-numbers" class="muted"></div>
+            </div>
+            <p id="pool-empty" class="muted" hidden>No data disk yet: new files go to the system disk. Add a disk below.</p>
+            <div class="table-wrap">
+                <table id="branches">
+                    <thead><tr><th>Disk</th><th>Device</th><th>Size</th><th>Used</th><th>Free</th><th>State</th><th></th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Stack data</h2>
+                <div class="spacer"></div>
+                <button id="btn-drain" class="btn" type="button">Empty system disk</button>
+                <button id="btn-link" class="btn primary" type="button" hidden>Move data to pool</button>
+            </div>
+            <div id="banner-held" class="banner warn" hidden>
+                <strong>Jellyfin is stopped</strong> while a disk is missing: its library scan would
+                forget the missing titles and their watch history. It restarts by itself when the disk is back.
+            </div>
+            <dl id="stack" class="kv"></dl>
+            <p class="muted small">The Immich database always stays on the system disk: a database on a USB disk is easily corrupted.</p>
+        </section>
+
+        <section class="card">
+            <div class="card-head"><h2>Disks that can be added</h2></div>
+            <p id="disks-empty" class="muted" hidden>No additional disk detected. Plug one in and press Refresh.</p>
+            <div class="table-wrap">
+                <table id="disks">
+                    <thead><tr><th>Device</th><th>Size</th><th>Bus</th><th>Model</th><th>In use</th><th></th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="card">
+            <div class="card-head">
+                <h2>Last operation</h2>
+                <span id="job-state" class="badge"></span>
+            </div>
+            <p class="muted small">Operations run on the server: closing this page does not stop them.</p>
+            <pre id="job-log" class="log">No operation yet.</pre>
+        </section>
+    </div>
+</main>
+
+<dialog id="dlg">
+    <form method="dialog" id="dlg-form">
+        <h2 id="dlg-title"></h2>
+        <div id="dlg-body"></div>
+        <label id="dlg-check-row" class="check" hidden>
+            <input type="checkbox" id="dlg-check"> <span id="dlg-check-label"></span>
+        </label>
+        <label id="dlg-confirm-row" class="confirm" hidden>
+            <span>To confirm, type <code id="dlg-confirm-word"></code></span>
+            <input type="text" id="dlg-confirm" autocomplete="off" spellcheck="false">
+        </label>
+        <div class="dlg-actions">
+            <button value="cancel" class="btn" type="submit" formnovalidate>Cancel</button>
+            <button value="ok" id="dlg-ok" class="btn primary" type="submit"></button>
+        </div>
+    </form>
+</dialog>
+</body>
+</html>

@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+export DEBIAN_FRONTEND=noninteractive
+for p in ifupdown dhcpcd-base isc-dhcp-client network-manager; do
+    if dpkg -s "$p" >/dev/null 2>&1; then apt-get purge -y "$p"; fi
+done
+rm -f /etc/ssh/ssh_host_*
+# Cockpit's terminal starts a NON-login bash: /etc/profile.d is not read there.
+# The setup user's ~/.bashrc is copied from /etc/skel at the 1st boot (useradd -m)
+grep -q 'egos-storage.sh' /etc/skel/.bashrc || printf '\n%s\n%s\n' \
+    "# EgOS: storage-* aliases also in non-login shells (Cockpit terminal)" \
+    '[ -r /etc/profile.d/egos-storage.sh ] && . /etc/profile.d/egos-storage.sh' >> /etc/skel/.bashrc

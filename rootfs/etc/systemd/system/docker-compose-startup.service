@@ -1,0 +1,17 @@
+[Unit]
+Description=Deploy Docker Compose stack after first-boot setup
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+ConditionPathExists=/var/lib/setup-complete
+ConditionPathExists=!/var/lib/docker-compose-done
+
+[Service]
+Type=oneshot
+# waits up to 120s for DNS; the "-" ignores a timeout (the wizard's set -e decides later)
+ExecStartPre=-/usr/bin/timeout 120 /bin/sh -c 'until getent hosts deb.debian.org >/dev/null; do sleep 2; done'
+ExecStart=/usr/local/bin/deploy-compose.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

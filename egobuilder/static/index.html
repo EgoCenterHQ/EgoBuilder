@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EgoBuilder</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232f6fdb'/%3E%3Cpath d='M9 9h14v3H12.5v2.5H21v3h-8.5V20H23v3H9z' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">E</span>
+    <div><strong>EgoBuilder</strong><small id="egos-version">EgOS</small></div>
+  </div>
+  <div class="top-actions">
+    <label class="btn ghost" title="Load a .json profile">Import<input type="file" id="import" accept=".json,application/json" hidden></label>
+    <button class="btn ghost" id="export">Export</button>
+    <button class="btn ghost" id="reset">Reset</button>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="steps" id="steps">
+    <button data-step="0"><span class="n">1</span><span>System</span><em class="badge" hidden></em></button>
+    <button data-step="1"><span class="n">2</span><span>Accounts</span><em class="badge" hidden></em></button>
+    <button data-step="2"><span class="n">3</span><span>Apps</span><em class="badge" hidden></em></button>
+    <button data-step="3"><span class="n">4</span><span>Services &amp; advanced</span><em class="badge" hidden></em></button>
+    <button data-step="4"><span class="n">5</span><span>Summary &amp; build</span><em class="badge" hidden></em></button>
+  </nav>
+
+  <main>
+    <!-- 1. SYSTEM -->
+    <section class="step" data-step="0">
+      <h1>System</h1>
+      <p class="lead">Language, keyboard and machine name. Everything is written into the installer and the apps.</p>
+      <div class="grid">
+        <label class="field"><span>Profile name</span>
+          <input data-bind="profile_name" maxlength="40" pattern="[A-Za-z0-9._-]+">
+          <small>Ends up in /etc/egos-release and in the archive name.</small></label>
+        <label class="field"><span>System language</span><select data-bind="system.locale" id="locale"></select>
+          <small>Also sets keyboard, time zone and the Jellyfin/Navidrome/OCR language.</small></label>
+        <label class="field"><span>Keyboard</span><select data-bind="system.keyboard" id="keyboard"></select></label>
+        <label class="field"><span>Time zone</span><input data-bind="system.timezone" list="tzlist" autocomplete="off"><datalist id="tzlist"></datalist></label>
+        <label class="field"><span>Hostname</span><input data-bind="system.hostname" autocomplete="off">
+          <small>Network address: <b class="mono" data-show="host"></b></small></label>
+        <label class="field"><span>Domain</span><input data-bind="system.domain"><small>Do not use "local" (reserved for mDNS).</small></label>
+        <label class="field"><span>Network display name</span><input data-bind="system.server_label"><small>Samba and Bonjour/Avahi.</small></label>
+      </div>
+    </section>
+
+    <!-- 2. ACCOUNTS -->
+    <section class="step" data-step="1" hidden>
+      <h1>Accounts</h1>
+      <p class="lead">Root for the console, the everyday user for Cockpit, Samba and the apps.</p>
+      <h2>Root</h2>
+      <div class="grid">
+        <label class="field"><span>Root password</span>
+          <div class="pw"><input type="password" data-bind="accounts.root_password" autocomplete="new-password">
+            <button class="btn small" type="button" data-gen="accounts.root_password">Generate</button>
+            <button class="btn small ghost" type="button" data-toggle-pw>Show</button></div>
+          <small>Only the SHA-512 hash goes into the image.</small></label>
+        <label class="check"><input type="checkbox" data-bind="accounts.lock_root"><span>Lock root login after installation<small>You log in as the user (sudo). Before setup, console login will not be possible.</small></span></label>
+      </div>
+      <h2>User</h2>
+      <div class="cards2">
+        <label class="choice"><input type="radio" name="umode" data-bind="accounts.user_mode" value="firstboot">
+          <span><b>At first boot</b> — like EgOS today: the machine opens the setup Wi-Fi and a page where you choose user, email and password.</span></label>
+        <label class="choice"><input type="radio" name="umode" data-bind="accounts.user_mode" value="preset">
+          <span><b>Preset</b> — the user is already in the image: no setup page, the first boot creates the user and restarts.</span></label>
+      </div>
+      <div class="grid" data-if="accounts.user_mode=preset">
+        <label class="field"><span>Username</span><input data-bind="accounts.user" autocomplete="off"></label>
+        <label class="field"><span>Email</span><input type="email" data-bind="accounts.email" autocomplete="off"><small>Immich login.</small></label>
+        <label class="field"><span>Password</span>
+          <div class="pw"><input type="password" data-bind="accounts.password" autocomplete="new-password">
+          <button class="btn small" type="button" data-gen="accounts.password">Generate</button>
+          <button class="btn small ghost" type="button" data-toggle-pw>Show</button></div>
+          <small>Linux, Samba, Cockpit and app admin.</small></label>
+      </div>
+      <div class="note warn" data-if="accounts.user_mode=preset">The user password is stored in clear text in the image (<span class="mono">/var/lib/setup-data.json</span>): keep the ISO to yourself.</div>
+      <h2 data-if="accounts.user_mode=firstboot">Setup Wi-Fi</h2>
+      <div class="grid" data-if="accounts.user_mode=firstboot">
+        <label class="field"><span>Network name (SSID)</span><input data-bind="setup.ssid"></label>
+        <label class="field"><span>Wi-Fi password</span>
+          <div class="pw"><input data-bind="setup.wifi_password"><button class="btn small" type="button" data-gen="setup.wifi_password">Generate</button></div></label>
+        <label class="field"><span>Wi-Fi country</span><input data-bind="setup.wifi_country" maxlength="2" class="short"></label>
+        <label class="field"><span>Setup page name</span><input data-bind="setup.mdns_name"><small>http://<b class="mono" data-show="setup"></b></small></label>
+      </div>
+    </section>
+
+    <!-- 3. APPS -->
+    <section class="step" data-step="2" hidden>
+      <h1>Apps</h1>
+      <p class="lead">Docker Compose containers started at the second boot. Data in <span class="mono">~/app</span>, media and documents in the disk pool <span class="mono">/srv/egos/pool</span>.</p>
+      <div class="apps-bar"><span id="apps-count"></span><input type="search" id="apps-filter" placeholder="Search apps"></div>
+      <div id="apps"></div>
+      <h2>Custom apps</h2>
+      <p class="hint">A service in docker-compose format. Published ports are checked against the other apps.</p>
+      <div id="customs"></div>
+      <button class="btn" type="button" id="add-custom">+ Add custom app</button>
+    </section>
+
+    <!-- 4. SERVICES -->
+    <section class="step" data-step="3" hidden>
+      <h1>Services &amp; advanced</h1>
+      <p class="lead">What the wizard does not ask: remote access, shares, packages, installation.</p>
+      <h2>Access</h2>
+      <div class="grid">
+        <label class="check"><input type="checkbox" data-bind="services.ssh"><span>SSH<small>port 22</small></span></label>
+        <label class="check" data-if="services.ssh"><input type="checkbox" data-bind="services.ssh_password_auth"><span>SSH password login<small>Off = keys only</small></span></label>
+        <label class="check"><input type="checkbox" data-bind="services.cockpit"><span>Cockpit<small>panel https://host:9090 with the Storage pool page</small></span></label>
+        <label class="check"><input type="checkbox" data-bind="services.samba"><span>Samba shared folder<small>\\host\media on the pool</small></span></label>
+      </div>
+      <label class="field wide"><span>Authorized SSH keys</span>
+        <textarea data-bind="services.ssh_keys" rows="3" placeholder="ssh-ed25519 AAAA... you@pc" spellcheck="false"></textarea>
+        <small>Copied to ~/.ssh/authorized_keys of the user created at first boot.</small></label>
+      <h2>System</h2>
+      <div class="grid">
+        <label class="check"><input type="checkbox" data-bind="services.docker_log_limit"><span>Limit container logs<small>10 MB × 3 files per container</small></span></label>
+        <label class="check"><input type="checkbox" data-bind="services.auto_updates"><span>Automatic security updates<small>unattended-upgrades</small></span></label>
+        <label class="field wide"><span>Extra Debian packages</span><input data-bind="packages.extra" data-list placeholder="vim tmux ncdu" spellcheck="false"><small>Space separated, from the trixie repository.</small></label>
+      </div>
+      <h2>Installation</h2>
+      <div class="grid">
+        <div class="field"><span>System disk partitioning</span><div id="partitioning" class="radios"></div></div>
+        <div class="field"><span>When installation ends</span><div class="radios">
+          <label><input type="radio" name="after" data-bind="install.after_install" value="poweroff"> Power off (remove the USB stick)</label>
+          <label><input type="radio" name="after" data-bind="install.after_install" value="reboot"> Reboot</label></div></div>
+      </div>
+    </section>
+
+    <!-- 5. SUMMARY -->
+    <section class="step" data-step="4" hidden>
+      <h1>Summary &amp; build</h1>
+      <div id="problems"></div>
+      <div class="summary" id="summary"></div>
+      <h2>Addresses after installation</h2>
+      <table class="urls" id="urls"></table>
+      <h2>Generated files</h2>
+      <p class="hint">Differences from the EgOS repo. Passwords are not shown.</p>
+      <div class="files"><ul id="file-list"></ul><div class="file-view"><div class="file-tabs"><button data-view="diff" class="on">Diff</button><button data-view="content">Full file</button></div><pre id="file-content"></pre></div></div>
+      <h2>Build the image</h2>
+      <div class="actions">
+        <button class="btn primary" id="stage">Prepare the tree</button>
+        <span class="hint" id="engine"></span>
+      </div>
+      <div id="job"></div>
+      <h2>Previous builds</h2>
+      <div id="jobs"></div>
+    </section>
+
+    <footer class="nav">
+      <button class="btn ghost" id="prev">← Back</button>
+      <span class="status" id="vstatus"></span>
+      <button class="btn primary" id="next">Next →</button>
+    </footer>
+  </main>
+</div>
+
+<template id="tpl-custom">
+  <div class="custom card">
+    <div class="grid">
+      <label class="field"><span>Id</span><input data-c="id" placeholder="whoami" spellcheck="false"></label>
+      <label class="field"><span>Name</span><input data-c="name" placeholder="Whoami"></label>
+      <label class="check"><input type="checkbox" data-c="enabled"><span>Enabled</span></label>
+    </div>
+    <label class="field wide"><span>Services (compose)</span><textarea data-c="compose" rows="7" spellcheck="false" placeholder="whoami:&#10;  image: docker.io/traefik/whoami:v1.10&#10;  ports:&#10;    - '8099:80'&#10;  restart: unless-stopped"></textarea></label>
+    <div class="grid">
+      <label class="field"><span>.env variables</span><textarea data-c="env" rows="3" spellcheck="false" placeholder="WHOAMI_NAME=egos&#10;DB_PASS=__RANDOM__"></textarea><small>__RANDOM__, __USER__, __PASSWORD__, __EMAIL__, __HOME__ are replaced on the machine.</small></label>
+      <label class="field"><span>Folders in the pool</span><input data-c="pool_dirs" placeholder="media/Photos2 backup"><small>Under /srv/egos/pool</small></label>
+      <label class="field"><span>Folders in home</span><input data-c="home_dirs" placeholder="app/whoami"><small>Under the user's home</small></label>
+    </div>
+    <button class="btn small danger" type="button" data-c-remove>Remove</button>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

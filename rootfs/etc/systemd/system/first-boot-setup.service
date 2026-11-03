@@ -1,0 +1,13 @@
+[Unit]
+Description=Initial Setup Webapp
+After=network.target
+Wants=network.target
+ConditionPathExists=!/var/lib/setup-complete
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/setup-webapp.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+{
+    "version": 0,
+    "menu": {
+        "index": {
+            "label": "Storage pool",
+            "order": 35,
+            "keywords": [
+                { "matches": ["egos", "pool", "disk", "mergerfs", "storage", "samba"] }
+            ]
+        }
+    }
+}

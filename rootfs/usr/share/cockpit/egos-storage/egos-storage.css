@@ -1,0 +1,119 @@
+/* EgOS storage page. No PatternFly in base1 on Cockpit 337: small own stylesheet,
+   light/dark through the .dark class set from Cockpit's shell:style setting. */
+:root {
+    --bg: #f0f0f0;
+    --card: #ffffff;
+    --text: #151515;
+    --muted: #6a6e73;
+    --border: #d2d2d2;
+    --primary: #0066cc;
+    --primary-text: #ffffff;
+    --ok: #3e8635;
+    --ok-bg: #f3faf2;
+    --danger: #c9190b;
+    --danger-bg: #faeae8;
+    --warn: #795600;
+    --warn-bg: #fdf7e7;
+    --busy: #2b9af3;
+    --busy-bg: #e7f1fa;
+    --bar: #e0e0e0;
+    --log-bg: #1e1e1e;
+    --log-text: #e0e0e0;
+    color-scheme: light;
+}
+:root.dark {
+    --bg: #1b1d21;
+    --card: #26292d;
+    --text: #e0e0e0;
+    --muted: #a2a6ab;
+    --border: #44484c;
+    --primary: #4d9de0;
+    --primary-text: #0f1214;
+    --ok: #7cc674;
+    --ok-bg: #1e2e1c;
+    --danger: #fe5142;
+    --danger-bg: #3b1b18;
+    --warn: #f0ab00;
+    --warn-bg: #33290e;
+    --busy: #73bcf7;
+    --busy-bg: #172a3a;
+    --bar: #3c3f42;
+    --log-bg: #111315;
+    --log-text: #d2d2d2;
+    color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }   /* .check/.usage set display: hidden must still win */
+html, body { margin: 0; background: var(--bg); color: var(--text); }
+body { font-family: "Red Hat Text", "RedHatText", "Overpass", system-ui, sans-serif; font-size: 14px; line-height: 1.5; }
+code, .mono, .log { font-family: "Red Hat Mono", "RedHatMono", ui-monospace, monospace; }
+code { font-size: 0.92em; overflow-wrap: anywhere; }
+
+.page { max-width: 1100px; margin: 0 auto; padding: 16px; }
+.page-head { display: flex; align-items: flex-start; gap: 16px; justify-content: space-between; margin-bottom: 12px; }
+h1 { font-size: 1.5rem; font-weight: 500; margin: 0 0 2px; }
+h2 { font-size: 1.1rem; font-weight: 500; margin: 0; }
+p { margin: 0 0 8px; }
+.muted { color: var(--muted); }
+.small { font-size: 0.86em; }
+.right { text-align: right; }
+.spacer { flex: 1; }
+.danger-text { color: var(--danger); font-weight: 500; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.card-head { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+
+.banner { border-radius: 8px; padding: 12px 16px; margin-bottom: 16px; border-left: 4px solid; }
+.banner.warn { background: var(--warn-bg); border-color: var(--warn); }
+.banner.danger { background: var(--danger-bg); border-color: var(--danger); }
+
+.badge { display: inline-block; padding: 1px 9px; border-radius: 999px; font-size: 0.82em; font-weight: 500;
+         background: var(--bar); color: var(--text); white-space: nowrap; }
+.badge:empty { display: none; }
+.badge.ok { background: var(--ok-bg); color: var(--ok); border: 1px solid var(--ok); }
+.badge.danger { background: var(--danger-bg); color: var(--danger); border: 1px solid var(--danger); }
+.badge.busy { background: var(--busy-bg); color: var(--busy); border: 1px solid var(--busy); }
+
+.btn { font: inherit; padding: 6px 14px; border-radius: 6px; border: 1px solid var(--border); background: var(--card);
+       color: var(--text); cursor: pointer; white-space: nowrap; }
+.btn:hover:not(:disabled) { border-color: var(--primary); }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: var(--primary-text); }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger-outline { color: var(--danger); border-color: var(--danger); background: transparent; }
+.btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.small-btn { padding: 3px 10px; font-size: 0.9em; }
+
+.usage { margin-bottom: 12px; }
+.bar { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; margin-bottom: 4px; }
+.bar-fill { height: 100%; width: 0; background: var(--primary); transition: width 0.4s; }
+.bar-fill.high { background: var(--danger); }
+
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; color: var(--muted); font-size: 0.86em; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+tr:last-child td { border-bottom: none; }
+
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0 0 10px; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+
+.log { background: var(--log-bg); color: var(--log-text); border-radius: 6px; padding: 12px; margin: 0;
+       max-height: 360px; overflow: auto; white-space: pre-wrap; font-size: 0.86em; }
+
+dialog { border: 1px solid var(--border); border-radius: 10px; padding: 20px; width: min(520px, calc(100vw - 32px));
+         background: var(--card); color: var(--text); }
+dialog::backdrop { background: rgba(0, 0, 0, 0.45); }
+dialog h2 { margin-bottom: 12px; }
+.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.confirm { display: block; margin: 12px 0; }
+.confirm input { display: block; width: 100%; margin-top: 4px; padding: 6px 8px; font: inherit; border-radius: 6px;
+                 border: 1px solid var(--border); background: var(--bg); color: var(--text); }
+.dlg-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+
+@media (max-width: 640px) {
+    .page-head { flex-direction: column; }
+    .kv { grid-template-columns: 1fr; gap: 0; }
+    .kv dd { margin-bottom: 8px; }
+}

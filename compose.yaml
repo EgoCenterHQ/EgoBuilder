@@ -1,0 +1,22 @@
+# EgoBuilder:  docker compose up -d --build   ->  http://localhost:8765
+services:
+  egobuilder:
+    build:
+      context: .
+      network: host               # apt-get in the Dockerfile uses the host network
+    image: egobuilder:latest
+    container_name: egobuilder
+    # live-build (ISO build) mounts /proc and creates device nodes in its chroot
+    privileged: true
+    # host network: the ISO build downloads ~1 GB, and on some hosts the bridge network
+    # cannot reach the internet (firewall/VPN, lost docker rules, blocked DNS fallback).
+    # The server listens on 127.0.0.1 only (see the Dockerfile): the app can start privileged builds.
+    network_mode: host
+    volumes:
+      - egobuilder-data:/data     # jobs: generated trees, logs, ISOs
+    # environment:
+    #   EGOBUILDER_ALLOWED_HOSTS: builder.lan   # extra Host names if published beyond localhost
+    restart: unless-stopped
+
+volumes:
+  egobuilder-data:

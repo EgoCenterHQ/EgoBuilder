@@ -1,0 +1,8 @@
+[Unit]
+Description=EgOS: reattach a pool disk that was plugged back in
+After=egos-pool.service docker.service egos-pool-guard.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/egos-storage _autoreattach
+TimeoutStartSec=1200

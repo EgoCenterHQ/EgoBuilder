@@ -1,0 +1,11 @@
+[Unit]
+Description=EgOS: keep Jellyfin stopped while a pool disk is missing
+After=docker.service egos-pool.service docker-compose-startup.service
+Wants=egos-pool.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/egos-storage _guard
+
+[Install]
+WantedBy=multi-user.target

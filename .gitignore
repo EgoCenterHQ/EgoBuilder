@@ -1,0 +1,30 @@
+# build output (make iso-amd64)
+/out/
+*.iso
+*.img
+*.log
+# live-build working dirs, if a script is run in place
+/build/*/chroot/
+/build/*/binary/
+/build/*/cache/
+/build/*/config/
+/build/*/keys/
+/build/*/rootfs/
+/build/*/.build/
+
+# secrets and local data: never commit
+.env
+*.env
+!env.example
+setup-data.json
+immichset.json
+jelluser.json
+old_chat/
+*.pre[0-9]*
+
+# tooling
+__pycache__/
+*.pyc
+.claude/
+.vscode/
+.idea/

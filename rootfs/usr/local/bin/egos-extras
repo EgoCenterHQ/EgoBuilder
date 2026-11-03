@@ -1,0 +1,81 @@
+#!/bin/bash
+# EgOS - optional stacks, not started by default.
+#   egos-extras list               available stacks and their state
+#   egos-extras enable <name>      copy to ~/app, create .env, start
+#   egos-extras disable <name>     stop (files and data are kept)
+set -euo pipefail
+
+SRC=/usr/local/share/stack/extras
+U=$(python3 -c "import json;print(json.load(open('/var/lib/setup-data.json'))['user'])" 2>/dev/null || true)
+[ -n "$U" ] && id "$U" >/dev/null 2>&1 || { echo "Setup user cannot be determined."; exit 1; }
+H=$(getent passwd "$U" | cut -d: -f6)
+
+# name -> directory (same paths as on the production box) and compose file
+dest_of() {
+    case "$1" in
+        qbtt)  echo "$H/app/qbtt/qbittorrent-nox-easywebapp" ;;
+        bento) echo "$H/app/pdf/bento" ;;
+        *) return 1 ;;
+    esac
+}
+compose_of() { case "$1" in bento) echo bento.yml ;; *) echo docker-compose.yml ;; esac; }
+media_dir() {
+    local m
+    m=$(grep -E '^JELLYFIN_MEDIA_LOCATION=' "$H/app/repos/.env" 2>/dev/null | tail -1 | cut -d= -f2-)
+    echo "${m:-/srv/egos/pool/media}"
+}
+as_user() { if [ "$(id -u)" -eq 0 ]; then chown -R "$U:$U" "$@"; fi; }
+dc() { local d="$1"; shift; ( cd "$d" && docker compose -f "$(compose_of "$NAME")" "$@" ); }
+
+do_list() {
+    local n d state
+    for n in qbtt bento; do
+        d=$(dest_of "$n")
+        if [ ! -d "$d" ]; then state="not installed"
+        elif NAME=$n dc "$d" ps -q 2>/dev/null | grep -q .; then state="running"
+        else state="stopped"; fi
+        printf '  %-6s %-14s %s\n' "$n" "$state" "$d"
+    done
+}
+
+do_enable() {
+    local d m
+    d=$(dest_of "$NAME") || { echo "Unknown stack: $NAME"; exit 1; }
+    mkdir -p "$d"
+    cp -r --update=none "$SRC/$NAME/." "$d/"   # never overwrite files already there
+    if [ -f "$d/env.example" ] && [ ! -f "$d/.env" ]; then
+        m=$(media_dir)
+        sed -e "s|__MEDIA__|$m|g" -e "s|__UID__|$(id -u "$U")|" -e "s|__GID__|$(id -g "$U")|" \
+            "$d/env.example" > "$d/.env"
+        chmod 600 "$d/.env"
+    fi
+    case "$NAME" in
+        qbtt) m=$(media_dir)
+              mkdir -p "$d/qbittorrent/config" "$m/downloads" "$m/Films" "$m/Musics" "$m/SerieTv"
+              as_user "$m/downloads" ;;
+    esac
+    as_user "$d"
+    if [ -f "$d/.env" ] && grep -q CHANGEME "$d/.env"; then
+        echo "Edit $d/.env (replace every CHANGEME), then run again:"
+        echo "  egos-extras enable $NAME"
+        exit 0
+    fi
+    dc "$d" up -d --build
+    [ "$NAME" = qbtt ] && echo "First start: follow $d/README.md (qBittorrent options, sort script)."
+    return 0
+}
+
+do_disable() {
+    local d
+    d=$(dest_of "$NAME") || { echo "Unknown stack: $NAME"; exit 1; }
+    [ -d "$d" ] || { echo "$NAME is not installed."; exit 0; }
+    dc "$d" down
+}
+
+NAME="${2:-}"
+case "${1:-list}" in
+    list)    do_list ;;
+    enable)  [ -n "$NAME" ] || { echo "Usage: egos-extras enable <qbtt|bento>"; exit 1; }; do_enable ;;
+    disable) [ -n "$NAME" ] || { echo "Usage: egos-extras disable <qbtt|bento>"; exit 1; }; do_disable ;;
+    *) echo "Usage: egos-extras [list|enable <name>|disable <name>]"; exit 1 ;;
+esac

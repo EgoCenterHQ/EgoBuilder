@@ -1,0 +1,1081 @@
+#!/bin/bash
+# EgOS - storage management: the mergerfs pool and its disks.
+#
+# The pool /srv/egos/pool ALWAYS exists, from the 1st boot: it is served by
+# egos-pool.service over /srv/egos/local (a folder on the system disk) plus
+# the data disks /srv/egos/disks/dataN. The stack lives on the pool from the
+# start, so adding a disk never moves data or changes a path.
+#   no data disk           -> branches: local=RW          (new files: system disk)
+#   one or more data disks -> branches: dataN=RW...:local=NC (new files: data disks;
+#                             what is already on local stays readable/writable)
+#   a disk missing at boot -> pool mounted with the disks present ("degraded"),
+#                             Jellyfin kept stopped until it returns (its library
+#                             scan would drop the missing titles and their metadata)
+#
+#   egos-storage add      (default)  formats a disk and joins it to the pool (hot)
+#   egos-storage status              pool and branch status
+#   egos-storage remove              retires a branch (disk still attached)
+#   egos-storage reattach            mounts disks that came back, refreshes the pool
+#                                    (alias: remount). Also AUTOMATIC: plugging a
+#                                    missing disk back in starts it via udev
+#   egos-storage drain               moves files from the system disk to the data disks
+#   egos-storage link                legacy installs only: moves stack data onto the pool
+# Non-interactive (Cockpit page "Storage pool", scripts):
+#   egos-storage status --json                  pool, branches, stack paths, job
+#   egos-storage disks --json                   disks that can be added
+#   egos-storage add --disk DEV --confirm DEV   (the confirmation repeats DEV)
+#   egos-storage remove --branch dataN --confirm dataN
+#   egos-storage link --yes [--immich]
+#   egos-storage job <command> <options>        runs it as the systemd unit
+#       egos-storage-job (survives a closed browser), log in $JOBLOG
+# Internal (systemd units): _pool (egos-pool.service), _pool-ready, _guard, _job,
+#   _autoreattach (egos-reattach.service, started by udev)
+set -euo pipefail
+
+POOL=/srv/egos/pool
+LOCAL=/srv/egos/local
+BRANCHES=/srv/egos/disks
+FSTAB=/etc/fstab
+ENVF=""
+JOBUNIT=egos-storage-job
+JOBLOG=/var/log/egos-storage/job.log
+POOL_UNIT=egos-pool.service
+RUNDIR=/run/egos
+DEGRADED=$RUNDIR/pool-degraded          # list of missing disks, absent when complete
+GATE=$RUNDIR/pool-ok                    # exists only when complete: Jellyfin binds it, so
+                                        # docker cannot start Jellyfin while a disk is missing
+HELD=/var/lib/egos/jellyfin-held        # persistent: "docker stop" survives a reboot
+LOCK=$RUNDIR/storage.lock               # one change at a time (page, shell, udev)
+MOTD=/etc/motd                          # Cockpit shows it on Overview, SSH at login
+DISK_WAIT="${DISK_WAIT:-60}"            # seconds the pool waits for slow (USB) disks at boot
+MFS_OPTS="allow_other,use_ino,cache.files=partial,dropcacheonclose=true,category.create=mfs"
+MFS_OPTS="$MFS_OPTS,moveonenospc=true,minfreespace=20G,fsname=egospool,statfs_ignore=nc"
+
+[ "$(id -u)" -eq 0 ] || { echo "Run with sudo."; exit 1; }
+
+CMD="${1:-add}"
+[ $# -gt 0 ] && shift
+OPT_JSON=0 OPT_DISK="" OPT_BRANCH="" OPT_CONFIRM="" OPT_YES=0 OPT_IMMICH=0
+case "$CMD" in
+    job|_job|_pool|_pool-ready|_guard|_autoreattach) ;;    # their arguments belong to the inner command
+    *)
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --json)    OPT_JSON=1 ;;
+            --disk)    OPT_DISK="${2:-}"; shift ;;
+            --branch)  OPT_BRANCH="${2:-}"; shift ;;
+            --confirm) OPT_CONFIRM="${2:-}"; shift ;;
+            --yes)     OPT_YES=1 ;;
+            --immich)  OPT_IMMICH=1 ;;
+            *) echo "Unknown option: $1"; exit 1 ;;
+        esac
+        shift
+    done ;;
+esac
+for c in lsblk parted mkfs.ext4 blkid findmnt mountpoint mergerfs udevadm setfattr chattr rsync dd cmp timeout wipefs tr flock findfs; do
+    command -v "$c" >/dev/null || { echo "Missing command: $c"; exit 1; }
+done
+mkdir -p "$POOL" "$LOCAL" "$BRANCHES"
+
+# --- fstab: managed lines are recognised by their mount point (field 2).
+#     No trailing comments: libmount only parses the 6 fields. ---
+#     Every rewrite goes through a temp file: NUL/control bytes are dropped,
+#     the result is flushed and validated before it replaces the real fstab
+#     (2026-10-24: a non-atomic write left 256 NUL bytes and data1 unmounted).
+fstab_commit() {   # $1 = candidate file
+    local tmp="$1" out
+    sync "$tmp"
+    # only parse errors count: an unplugged nofail disk is an "error" for
+    # --verify but a legitimate state here. The root line must survive.
+    out=$(findmnt --verify --tab-file "$tmp" 2>&1 || true)
+    if ! grep -q '^0 parse errors' <<<"$out" \
+       || ! awk '$1 !~ /^#/ && $2 == "/" { f = 1 } END { exit !f }' "$tmp"; then
+        echo "fstab check failed, $FSTAB NOT changed:"
+        printf '%s\n' "$out"
+        rm -f "$tmp"; return 1
+    fi
+    cp -p "$FSTAB" "$FSTAB.egos-prev"
+    mv -f "$tmp" "$FSTAB"
+    sync "$FSTAB"
+}
+
+fstab_del() {
+    local tmp="$FSTAB.egos.$$"
+    tr -d '\000' < "$FSTAB" \
+        | awk -v mp="$1" '$0 ~ /^[[:space:]]*#/ || $2 != mp { print }' > "$tmp"
+    fstab_commit "$tmp"
+}
+
+fstab_add() {      # $1 = complete fstab line
+    local tmp="$FSTAB.egos.$$"
+    { tr -d '\000' < "$FSTAB"; printf '%s\n' "$1"; } > "$tmp"
+    fstab_commit "$tmp"
+}
+
+# --- one change at a time ---------------------------------------------------
+# The Cockpit job, a shell command and the udev reattach could otherwise race
+# (e.g. "add" formats a disk labelled egos-dataN: udev sees a pool disk appear).
+storage_lock() {   # $1 = seconds to wait (0 = fail at once)
+    mkdir -p "$RUNDIR"
+    exec 9>"$LOCK"
+    flock -w "${1:-0}" 9 || { echo "Another storage operation is running: retry when it ends."; exit 1; }
+}
+
+# --- disk-missing warning in /etc/motd ---------------------------------------
+# Cockpit shows /etc/motd as a banner on the Overview page (the first page after
+# login) and sshd prints it at login. Only the block between the markers is ours.
+MOTD_BEGIN="*** EgOS STORAGE WARNING"       # our block: from this line...
+MOTD_END="*** end of EgOS storage warning ***" # ...to this one, at the top of the file
+motd_update() {   # $1 = missing disks (one per line), empty = clear the warning
+    [ -f "$MOTD" ] || touch "$MOTD"
+    local tmp="$MOTD.egos.$$"
+    {
+        if [ -n "$1" ]; then
+            local names held=""
+            names=$(printf '%s\n' "$1" | xargs -rn1 basename | tr '\n' ' ')
+            [ -f "$HELD" ] && held=" Jellyfin is stopped until it is back."
+            echo "$MOTD_BEGIN: pool disk missing: ${names% } ***"
+            echo "Its files are not visible.$held"
+            echo "Reconnect the disk: it is reattached automatically."
+            echo "Details: Cockpit > Storage pool (or: storage-status)"
+            echo "$MOTD_END"
+        fi
+        awk -v b="$MOTD_BEGIN" -v e="$MOTD_END" \
+            'index($0, b) == 1 { skip = 1 } !skip { print } $0 == e { skip = 0 }' "$MOTD"
+    } > "$tmp"
+    if cmp -s "$tmp" "$MOTD"; then rm -f "$tmp"; else chmod 644 "$tmp"; mv -f "$tmp" "$MOTD"; fi
+}
+
+# --- the pool ---------------------------------------------------------------
+# NEVER unmount or restart the pool under a running stack: the containers keep
+# their bind mounts on the old (dead) FUSE mount and see empty folders until
+# they are restarted. Every change is applied hot, via the branch xattr.
+pool_mounted() { findmnt -rno TARGET "$POOL" >/dev/null 2>&1; }
+
+configured_disks() {   # data disks in fstab, in data1, data2, ... order
+    awk -v b="$BRANCHES/data" '$1 !~ /^#/ && index($2, b) == 1 { print $2 }' "$FSTAB" | sort -V
+}
+
+missing_disks() {
+    local d
+    for d in $(configured_disks); do mountpoint -q "$d" || echo "$d"; done
+}
+
+# runtime branch list: data disks present first (reads hit them first), the
+# system-disk folder last; it takes new files only while no data disk exists
+branch_list() {
+    local list="" d any=0
+    for d in $(configured_disks); do
+        any=1
+        mountpoint -q "$d" && list="$list${list:+:}$d=RW"
+    done
+    if [ "$any" = 1 ]; then list="$list${list:+:}$LOCAL=NC"; else list="$LOCAL=RW"; fi
+    echo "$list"
+}
+
+update_state() {   # degraded marker for the page and the Jellyfin guard
+    mkdir -p "$RUNDIR"
+    local m
+    m=$(missing_disks)
+    if [ -n "$m" ]; then
+        printf '%s\n' "$m" > "$DEGRADED"
+        rmdir "$GATE" 2>/dev/null || true
+    else
+        rm -f "$DEGRADED"
+        mkdir -p "$GATE"
+    fi
+    motd_update "$m" || true
+}
+
+# The mergerfs daemon must live in egos-pool.service, not in the caller's
+# cgroup: run from the Cockpit job (transient unit) it would be killed with
+# the job when it ends, and the pool would vanish.
+pool_start() {
+    systemctl start "$POOL_UNIT" && pool_mounted
+}
+
+# HOT update: mergerfs rereads the whole branch list via xattr on the .mergerfs
+# control file, without unmounting. Containers notice nothing.
+# ("user.mergerfs.branches": srcmounts is read-only in Debian 13's mergerfs)
+pool_sync() {
+    if ! pool_mounted; then
+        echo "Pool not mounted: starting $POOL_UNIT..."
+        pool_start || { echo "The pool could not be started (journalctl -u $POOL_UNIT)."; return 1; }
+        update_state
+        return 0
+    fi
+    local list
+    list=$(branch_list)
+    if ! setfattr -n user.mergerfs.branches -v "$list" "$POOL/.mergerfs"; then
+        echo "Could not update the pool branches (wanted: $list)."
+        return 1
+    fi
+    update_state
+    echo "Pool branches: $list"
+}
+
+mfs_branches() {   # $1 = "-/path" (remove one branch)
+    setfattr -n user.mergerfs.branches -v "$1" "$POOL/.mergerfs" 2>/dev/null
+}
+
+# an empty mount point must never receive files: immutable while unmounted
+# (mounting over an immutable directory works; writing into it does not)
+guard_dir() { mountpoint -q "$1" || chattr +i "$1" 2>/dev/null || true; }
+unguard_dir() { mountpoint -q "$1" || chattr -i "$1" 2>/dev/null || true; }
+
+# --- egos-pool.service: ExecStart (foreground mergerfs) ---------------------
+do_pool_run() {
+    mkdir -p "$RUNDIR"
+    pool_mounted && { echo "$POOL is already mounted."; exit 1; }
+    # installs from before 4.2 mounted the pool from fstab
+    if awk -v p="$POOL" '$1 !~ /^#/ && $2 == p { f = 1 } END { exit !f }' "$FSTAB"; then
+        echo "Removing the old fstab pool line (the pool is now $POOL_UNIT)."
+        fstab_del "$POOL"
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+    guard_dir "$POOL"
+    local d
+    for d in $(configured_disks); do mkdir -p "$d"; guard_dir "$d"; done
+    # slow USB disks: wait for them, but never forever
+    local end=$((SECONDS + DISK_WAIT))
+    while [ -n "$(missing_disks)" ] && [ "$SECONDS" -lt "$end" ]; do sleep 2; done
+    update_state
+    if [ -s "$DEGRADED" ]; then
+        echo "DEGRADED: disk(s) missing after ${DISK_WAIT}s: $(tr '\n' ' ' < "$DEGRADED")"
+    fi
+    echo "Branches: $(branch_list)"
+    exec mergerfs -f -o "$MFS_OPTS" "$(branch_list)" "$POOL"
+}
+
+do_pool_ready() {  # ExecStartPost: the unit is "started" only once the pool is there
+    local i
+    for i in $(seq 1 $((DISK_WAIT + 30))); do
+        pool_mounted && return 0
+        sleep 1
+    done
+    echo "mergerfs did not mount $POOL"; return 1
+}
+
+# --- Jellyfin off while a disk is missing -----------------------------------
+# docker starts its containers by itself at boot, before any unit of ours can
+# intervene. So the compose file binds $GATE into Jellyfin (long syntax: docker
+# does NOT create a missing source): while a disk is missing the gate does not
+# exist and docker cannot start Jellyfin at all. egos-pool-guard.service only
+# records that (and stops Jellyfin on stacks deployed before the gate existed).
+jellyfin_release() {
+    [ -f "$HELD" ] || return 0
+    if docker start jellyfin >/dev/null 2>&1; then
+        rm -f "$HELD"; echo "Jellyfin started again: all disks are present."
+    else
+        echo "Jellyfin could not be started (docker start jellyfin)."
+    fi
+}
+
+do_guard() {
+    if [ -s "$DEGRADED" ]; then
+        local i
+        for i in $(seq 1 60); do
+            docker inspect jellyfin >/dev/null 2>&1 && break
+            sleep 1
+        done
+        docker inspect jellyfin >/dev/null 2>&1 || { echo "No Jellyfin container: nothing to hold."; return 0; }
+        mkdir -p "$(dirname "$HELD")"
+        touch "$HELD"
+        if [ "$(docker inspect -f '{{.State.Running}}' jellyfin 2>/dev/null)" = true ]; then
+            docker stop jellyfin >/dev/null 2>&1 || true
+            echo "Disk(s) missing: Jellyfin stopped (stack without the pool gate)."
+        else
+            echo "Disk(s) missing: Jellyfin kept off by the pool gate."
+        fi
+        motd_update "$(cat "$DEGRADED")" || true
+    else
+        jellyfin_release
+    fi
+}
+
+# --- reattach: disks that came back (cable, power) --------------------------
+do_reattach() {
+    local d n=0
+    for d in $(missing_disks); do
+        n=$((n+1))
+        echo "Mounting $d..."
+        # plain mount: fails at once if the disk is absent (the mount unit
+        # would wait for the device timeout). ext4 is in-kernel: no daemon.
+        if mount "$d" 2>/dev/null; then echo "  ok"; else echo "  still missing (disk not detected)"; fi
+    done
+    [ "$n" -gt 0 ] || echo "No disk missing."
+    pool_sync
+    local m
+    m=$(missing_disks)
+    if [ -n "$m" ]; then
+        echo
+        echo "Still missing: $(echo $m)"
+        echo "Check cable and power, then retry. If the disk is gone for good: storage-remove."
+        exit 3
+    fi
+    jellyfin_release
+    echo "All disks present."
+}
+
+# --- automatic reattach -----------------------------------------------------
+# 90-egos-reattach.rules: a partition labelled egos-data* appears -> udev starts
+# egos-reattach.service -> here. Nothing happens unless the pool is running and
+# a configured disk that was missing is now detected (at boot every present
+# disk is "added" too: egos-pool.service handles those).
+do_autoreattach() {
+    systemctl is-active --quiet "$POOL_UNIT" || { echo "Pool not running: nothing to do."; return 0; }
+    udevadm settle --timeout=30 || true     # several disks plugged together: one pass
+    storage_lock 900                        # wait for a running add/remove/drain
+    local d src back="" stale=0
+    for d in $(missing_disks); do
+        src=$(awk -v m="$d" '$1 !~ /^#/ && $2 == m { print $1; exit }' "$FSTAB")
+        [ -n "$src" ] && findfs "$src" >/dev/null 2>&1 && back="$back $d"
+    done
+    # mounted by someone else meanwhile, but the pool still marked degraded
+    [ -s "$DEGRADED" ] && [ -z "$(missing_disks)" ] && stale=1
+    if [ -z "$back" ] && [ "$stale" = 0 ]; then
+        echo "No missing pool disk came back: nothing to do."; return 0
+    fi
+    echo "Pool disk plugged back in:${back:- (already mounted)}"
+    mkdir -p "$(dirname "$JOBLOG")"
+    echo "== $(date '+%F %T') egos-storage reattach (automatic: disk plugged back in)" > "$JOBLOG"
+    local rc=0
+    ( do_reattach ) < /dev/null >> "$JOBLOG" 2>&1 || rc=$?
+    echo "== END rc=$rc $(date '+%F %T')" >> "$JOBLOG"
+    cat "$JOBLOG"                           # also in the journal
+    return 0
+}
+
+# --- Moves data onto the pool and rewrites the stack's .env ----------------
+env_get() { grep -E "^$1=" "$ENVF" | tail -1 | cut -d= -f2-; }
+
+move_tree() {   # $1 = .env key   $2 = destination on the pool
+    local key="$1" dest="$2" cur need avail
+    cur=$(env_get "$key")
+    [ -n "$cur" ] || { echo "  $key missing from .env, skipping"; return 0; }
+    if [ "$cur" = "$dest" ]; then echo "  $key already on the pool"; return 0; fi
+    [ -d "$cur" ] || { echo "  $cur does not exist, skipping"; return 0; }
+
+    need=$(du -sk "$cur" | cut -f1)
+    avail=$(df -Pk "$POOL" | tail -1 | awk '{print $4}')
+    if [ "$avail" -le $((need + 1048576)) ]; then
+        echo "  not enough space on the pool for $cur ($((need/1024)) MiB)"; return 1
+    fi
+
+    echo "  copying $cur -> $dest"
+    mkdir -p "$dest"
+    if ! rsync -aHAX --numeric-ids --info=progress2 --human-readable "$cur"/ "$dest"/; then
+        echo "  COPY FAILED: source intact, .env unchanged"; return 1
+    fi
+    # check 1: a second dry-run pass must have nothing to transfer
+    local pending
+    if ! pending=$(rsync -aHAXn --itemize-changes "$cur"/ "$dest"/); then
+        echo "  CHECK COULD NOT RUN: source intact, .env unchanged"; return 1
+    fi
+    if [ -n "$(printf '%s\n' "$pending" | grep -v '^\.' | grep -v '^$')" ]; then
+        echo "  CHECK FAILED: source intact, .env unchanged"; return 1
+    fi
+    # check 2: same number of files at source and destination
+    local nsrc ndst
+    nsrc=$(find "$cur" -type f | wc -l); ndst=$(find "$dest" -type f | wc -l)
+    if [ "$nsrc" -ne "$ndst" ]; then
+        echo "  CHECK FAILED ($nsrc files vs $ndst): source intact"; return 1
+    fi
+    mv "$cur" "$cur.pre-pool"
+    sed -i "s|^$key=.*|$key=$dest|" "$ENVF"
+    echo "  ok: original kept in $cur.pre-pool"
+}
+
+do_link() {
+    pool_mounted || { echo "Pool not mounted: systemctl status $POOL_UNIT"; exit 1; }
+    local U H
+    U=$(python3 -c "import json;print(json.load(open('/var/lib/setup-data.json'))['user'])" 2>/dev/null || true)
+    [ -n "$U" ] && id "$U" >/dev/null 2>&1 || { echo "Setup user cannot be determined."; exit 1; }
+    H="/home/$U"
+    ENVF="$H/app/repos/.env"
+    [ -f "$ENVF" ] || { echo "$ENVF not found: the stack has not been configured yet."; exit 1; }
+
+    echo "Moves the stack data onto the pool. Immich's Postgres stays on the NVMe:"
+    echo "a database on a USB disk is the fastest way to corrupt it."
+    echo
+    local DO_IMMICH=n go=n gocopy=s
+    if [ "$OPT_YES" = 1 ]; then
+        [ "$OPT_IMMICH" = 1 ] && DO_IMMICH=y
+        go=y
+        echo "Immich originals: $([ "$DO_IMMICH" = y ] && echo moved || echo left in place)"
+    else
+        read -r -p "Also move the Immich originals (UPLOAD_LOCATION)? [y/N] " DO_IMMICH
+        echo
+        echo "The stack is stopped during the copy and restarted at the end."
+        read -r -p "Proceed? [y/N] " go
+    fi
+    case "${go:-n}" in s|S|si|SI|y|Y) ;; *) echo "Cancelled."; exit 0 ;; esac
+
+    cp "$ENVF" "$ENVF.bak.$(date +%Y%m%d%H%M%S)"
+    ( cd "$H/app/repos" && docker compose down ) || true
+
+    echo
+    [ "$OPT_YES" = 1 ] || read -r -p "Docker stack stopped? Continue with the copy? [Y/n] " gocopy
+    case "${gocopy:-s}" in
+        n|N|no|NO) echo "Copy cancelled. The stack is stopped: restart it with"
+                   echo "  cd $H/app/repos && docker compose up -d"
+                   exit 0 ;;
+    esac
+    echo
+
+    local rc=0
+    move_tree JELLYFIN_MEDIA_LOCATION "$POOL/media" || rc=1
+    case "${DO_IMMICH:-n}" in
+        s|S|si|SI|y|Y) move_tree UPLOAD_LOCATION "$POOL/immich/upload" || rc=1 ;;
+    esac
+
+    chown -R "$U:$U" "$POOL" 2>/dev/null || true
+
+    # the [media] share follows the media folder (prod had to be edited by hand)
+    local MEDIA
+    MEDIA=$(env_get JELLYFIN_MEDIA_LOCATION)
+    if [ -n "$MEDIA" ] && [ -f /etc/samba/smb.conf ]; then
+        sed -i "/^\[media\]/,/^\[/ s|^\([[:space:]]*path[[:space:]]*=\).*|\1 $MEDIA|" /etc/samba/smb.conf
+        systemctl restart smbd 2>/dev/null || true
+        systemctl restart wsdd2 2>/dev/null || true
+        echo "Samba share [media] -> $MEDIA"
+    fi
+
+    ( cd "$H/app/repos" && docker compose up -d )
+
+    echo
+    if [ "$rc" -eq 0 ]; then
+        echo "Link completed. Current paths:"
+    else
+        echo "Completed with errors: review the messages above. Current paths:"
+    fi
+    grep -E '^(JELLYFIN_MEDIA_LOCATION|UPLOAD_LOCATION|DB_DATA_LOCATION)=' "$ENVF"
+    echo
+    echo "The .pre-pool directories stay on the NVMe until you delete them by hand."
+}
+
+do_status() {
+    echo "== Branches =="
+    findmnt -rno TARGET,SOURCE,SIZE,AVAIL --target "$BRANCHES" 2>/dev/null || true
+    local d
+    for d in "$BRANCHES"/data*; do
+        [ -d "$d" ] || continue
+        if findmnt -rno SOURCE "$d" >/dev/null 2>&1; then
+            printf '%-28s %s\n' "$d" "$(findmnt -rno SOURCE,SIZE,AVAIL "$d")"
+        else
+            printf '%-28s NOT MOUNTED\n' "$d"
+        fi
+    done
+    printf '%-28s %s (system disk)\n' "$LOCAL" "$(du -sh "$LOCAL" 2>/dev/null | cut -f1)"
+    echo
+    echo "== Pool =="
+    if pool_mounted; then
+        df -h "$POOL" | tail -1
+        echo "Branches: $(getfattr --only-values -n user.mergerfs.branches "$POOL/.mergerfs" 2>/dev/null)"
+        [ -s "$DEGRADED" ] && echo "DEGRADED, missing: $(tr '\n' ' ' < "$DEGRADED")"
+        [ -f "$HELD" ] && echo "Jellyfin is stopped until the missing disk returns (storage-reattach)."
+    else
+        echo "$POOL not mounted (systemctl status $POOL_UNIT)"
+    fi
+    return 0
+}
+
+# --- Checks that the disk really keeps what it writes ---------------------
+# A fake-capacity device accepts writes, reports success and
+# returns different data: mkfs succeeds, ext4 gets corrupted later.
+# The test checks three things: integrity of the data read back, no new
+# ext4 errors in the kernel, minimum acceptable speed.
+VERIFY_MB="${VERIFY_MB:-128}"
+VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-180}"
+
+verify_disk() {
+    local mp="$1"
+    local pat="/var/tmp/.egos-verify.$$" dst="$mp/.egos-verify.bin"
+    local err0 err1 t0 secs rate
+    echo "Integrity check on ${VERIFY_MB} MiB (max ${VERIFY_TIMEOUT}s)..."
+    err0=$(dmesg 2>/dev/null | grep -c 'EXT4-fs error' || true)
+
+    dd if=/dev/urandom of="$pat" bs=1M count="$VERIFY_MB" status=none
+    t0=$SECONDS
+    if ! timeout "$VERIFY_TIMEOUT" dd if="$pat" of="$dst" bs=1M conv=fdatasync status=none; then
+        rm -f "$pat" "$dst"
+        echo "  FAILED: writing ${VERIFY_MB} MiB did not finish in ${VERIFY_TIMEOUT}s."
+        echo "  The disk is unusable at this speed."
+        return 1
+    fi
+    secs=$(( SECONDS - t0 )); [ "$secs" -gt 0 ] || secs=1
+    rate=$(( VERIFY_MB / secs ))
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
+
+    if ! cmp -s "$pat" "$dst"; then
+        rm -f "$pat" "$dst"
+        echo "  FAILED: the data read back does not match what was written."
+        echo "  Fake-capacity or faulty device: do NOT use it."
+        return 1
+    fi
+    rm -f "$pat" "$dst"
+
+    err1=$(dmesg 2>/dev/null | grep -c 'EXT4-fs error' || true)
+    if [ "$err1" -gt "$err0" ]; then
+        echo "  FAILED: the kernel logged $((err1-err0)) EXT4 errors during the test."
+        echo "  See: dmesg -T | grep EXT4"
+        return 1
+    fi
+    echo "  ok: data intact, no ext4 errors, about ${rate} MB/s write"
+    return 0
+}
+
+# --- Retiring a branch, TO BE RUN WITH THE DISK STILL ATTACHED ------------
+# Formats nothing: detaches the branch from the pool, flushes pending writes,
+# unmounts, cleans fstab, removes the device from the kernel and only then
+# says the disk can be unplugged. Also works on an already unplugged disk,
+# but in that case writes not yet on the platter are lost.
+do_remove() {
+    local -a MPS=()
+    local d src n=0
+    echo "Currently defined branches:"
+    for d in "$BRANCHES"/data*; do
+        [ -d "$d" ] || continue
+        n=$((n+1)); MPS+=("$d")
+        if src=$(findmnt -rno SOURCE "$d" 2>/dev/null); then
+            printf ' %2d) %-26s %-12s %s\n' "$n" "$d" "$src" \
+                   "$(findmnt -rno SIZE,USED,AVAIL "$d" 2>/dev/null)"
+        else
+            printf ' %2d) %-26s NOT MOUNTED\n' "$n" "$d"
+        fi
+    done
+    [ "$n" -gt 0 ] || { echo "No branch to remove."; exit 0; }
+
+    echo
+    local MP=""
+    if [ -n "$OPT_BRANCH" ]; then
+        for d in "${MPS[@]}"; do [ "$(basename "$d")" = "$OPT_BRANCH" ] && MP="$d"; done
+        [ -n "$MP" ] || { echo "Branch $OPT_BRANCH not found."; exit 1; }
+    else
+        read -r -p "Number of the branch to remove (Enter to cancel): " choice
+        [ -n "${choice:-}" ] || { echo "Cancelled."; exit 0; }
+        case "$choice" in ''|*[!0-9]*) echo "Invalid choice."; exit 1;; esac
+        [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ] || { echo "Choice out of range."; exit 1; }
+        MP="${MPS[$((choice-1))]}"
+    fi
+    local NAME SRC ATTACHED=0
+    NAME=$(basename "$MP")
+    SRC=$(findmnt -rno SOURCE "$MP" 2>/dev/null || true)
+    if [ -n "$SRC" ] && [ -b "$SRC" ]; then
+        ATTACHED=1
+        echo
+        echo "Disk attached: $SRC — the retirement will be complete and safe."
+    else
+        echo
+        echo "Disk NOT attached or not mounted: cleaning up the configuration only."
+    fi
+
+    # how many data disks would remain?
+    local left=0 x
+    for x in "$BRANCHES"/data*; do [ -d "$x" ] && [ "$x" != "$MP" ] && left=$((left+1)); done
+    if [ "$left" -eq 0 ]; then
+        echo
+        echo "This is the LAST data disk: the pool stays, new files go to the system"
+        echo "disk again ($LOCAL)."
+    fi
+
+    echo
+    echo "The files on this disk will disappear from the pool. The disk is NOT formatted."
+    if [ -n "$OPT_BRANCH" ]; then confirm="$OPT_CONFIRM"
+    else read -r -p "To confirm, type exactly $NAME : " confirm; fi
+    [ "$confirm" = "$NAME" ] || { echo "Confirmation does not match. Cancelled."; exit 1; }
+
+    # 1. hot detach, if the pool is mounted and still uses it
+    if pool_mounted && getfattr --only-values -n user.mergerfs.branches "$POOL/.mergerfs" 2>/dev/null \
+            | tr ':' '\n' | cut -d= -f1 | grep -qx "$MP"; then
+        if mfs_branches "-$MP"; then
+            echo "Branch hot-detached from the pool."
+        else
+            echo "Hot detach FAILED: nothing changed. Retry, or reboot and retry."
+            exit 1
+        fi
+    fi
+
+    # 2. flush pending writes: without this, unplugging the disk
+    #    means losing what is still in cache
+    echo "Flushing pending writes (sync)..."
+    sync
+
+    # 3. unmount. With the disk attached it must succeed CLEANLY:
+    #    a lazy unmount would leave pending writes on a disk the
+    #    user is about to unplug.
+    if [ "$ATTACHED" = 1 ]; then
+        if ! umount "$MP" 2>/dev/null; then
+            echo
+            echo "UNMOUNT REFUSED: something is keeping $MP open"
+            if command -v lsof >/dev/null; then lsof +D "$MP" 2>/dev/null | head -20; fi
+            echo
+            echo "Do NOT unplug the disk. Close the processes (usually the stack:"
+            echo "cd ~/app/repos && docker compose down) and repeat storage-remove."
+            # puts the branch back into the pool: state returns to what it was
+            pool_sync >/dev/null && echo "Branch put back into the pool: nothing changed."
+            exit 1
+        fi
+        echo "Unmounted: $MP"
+    else
+        if findmnt -rno TARGET "$MP" >/dev/null 2>&1; then
+            umount -f "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+        fi
+    fi
+
+    # 4. fstab and branch directory
+    fstab_del "$MP"
+    systemctl daemon-reload 2>/dev/null || true
+    if [ -n "$(ls -A "$MP" 2>/dev/null)" ]; then
+        echo "The directory $MP is NOT empty after unmounting:"
+        du -sh "$MP"
+        echo "These are files that ended up on the system disk: review and remove them by hand."
+    elif ! mountpoint -q "$MP"; then
+        unguard_dir "$MP"
+        rmdir "$MP" 2>/dev/null || true
+    fi
+
+    # 5. pool: branch list recomputed (local takes new files again if no disk is left)
+    pool_sync || true
+    if [ -z "$(missing_disks)" ]; then jellyfin_release; fi
+
+    # 6. remove the device from the kernel, then clear it for unplugging
+    if [ "$ATTACHED" = 1 ]; then
+        local DISK
+        DISK=$(lsblk -no PKNAME "$SRC" 2>/dev/null | head -1 || true)
+        sync
+        if [ -n "$DISK" ] && [ -e "/sys/block/$DISK/device/delete" ]; then
+            echo 1 > "/sys/block/$DISK/device/delete" 2>/dev/null || true
+            sleep 2
+            if [ -b "/dev/$DISK" ]; then
+                echo "Note: /dev/$DISK is still present; wait a few seconds."
+            else
+                echo "Device /dev/$DISK removed from the kernel."
+            fi
+        fi
+        echo
+        echo "============================================================"
+        echo "  YOU CAN NOW SAFELY UNPLUG THE DISK ($NAME)"
+        echo "============================================================"
+    else
+        echo
+        echo "Configuration cleaned up. The disk was already unplugged."
+    fi
+
+    echo
+    echo "Removed: $MP"
+    do_status
+}
+
+# --- disks that may be added: whole disks, not the system disk ------------
+sys_disk() {
+    local ROOTSRC PK
+    ROOTSRC=$(findmnt -no SOURCE /)
+    PK=$(lsblk -no PKNAME "$ROOTSRC" 2>/dev/null | head -1 || true)
+    [ -n "$PK" ] && echo "/dev/$PK"
+}
+
+candidates() {   # $1 = system disk. TSV: name size tran model mountpoints
+    # lsblk JSON: empty TRAN/MODEL fields do not shift the columns
+    python3 - "$1" <<'PY'
+import json, re, subprocess, sys
+sysdisk = sys.argv[1]
+out = subprocess.run(["lsblk", "-J", "-p", "-o", "NAME,TYPE,SIZE,TRAN,MODEL,MOUNTPOINTS"],
+                     capture_output=True, text=True, check=True).stdout
+def mounts(n):
+    m = [x for x in (n.get("mountpoints") or []) if x]
+    for c in n.get("children") or []:
+        m += mounts(c)
+    return m
+for n in sorted(json.loads(out)["blockdevices"], key=lambda d: d["name"]):
+    name = n["name"]
+    if n.get("type") != "disk" or name == sysdisk:
+        continue
+    # zram/loop: virtual; fd: legacy floppy controller found on x86 boards and VMs
+    if name.startswith(("/dev/zram", "/dev/loop", "/dev/fd")):
+        continue
+    # eMMC hardware boot areas / RPMB show up as "disks" but are not usable
+    if re.match(r"/dev/mmcblk\d+(boot\d+|rpmb)$", name):
+        continue
+    f = [name, n.get("size") or "-", n.get("tran") or "-",
+         (n.get("model") or "-").strip(), " ".join(mounts(n))]
+    print("\t".join(x.replace("\t", " ") for x in f))
+PY
+}
+
+do_disks_json() {
+    local SYSDISK
+    SYSDISK=$(sys_disk) || true
+    [ -n "$SYSDISK" ] || { echo "System disk cannot be determined: aborting."; exit 1; }
+    candidates "$SYSDISK" | python3 -c '
+import json, sys
+keys = ["name", "size", "tran", "model", "mountpoints"]
+print(json.dumps([dict(zip(keys, l.rstrip("\n").split("\t"))) for l in sys.stdin if l.strip()]))'
+}
+
+do_add() {
+    local SYSDISK
+    SYSDISK=$(sys_disk) || true
+    [ -n "$SYSDISK" ] || { echo "System disk cannot be determined from $(findmnt -no SOURCE /): aborting."; exit 1; }
+
+    echo "System disk (excluded): $SYSDISK"
+    echo
+    local -a DEVS=()
+    local n=0 name size tran model mnt DEV=""
+    while IFS=$'\t' read -r name size tran model mnt; do
+        n=$((n+1)); DEVS+=("$name")
+        [ -n "$OPT_DISK" ] && continue
+        [ "$n" -eq 1 ] && echo "Available disks:"
+        printf ' %2d) %-14s %-8s %-6s %-24s %s\n' "$n" "$name" "$size" "$tran" "$model" \
+               "${mnt:+[in use: $mnt]}"
+    done < <(candidates "$SYSDISK")
+
+    [ "$n" -gt 0 ] || { echo "No additional disk detected."; exit 1; }
+    if [ -n "$OPT_DISK" ]; then
+        local x
+        for x in "${DEVS[@]}"; do [ "$x" = "$OPT_DISK" ] && DEV="$x"; done
+        [ -n "$DEV" ] || { echo "$OPT_DISK is not a disk that can be added."; exit 1; }
+    else
+        echo
+        read -r -p "Number of the disk to add (Enter to cancel): " choice
+        [ -n "${choice:-}" ] || { echo "Cancelled."; exit 0; }
+        case "$choice" in ''|*[!0-9]*) echo "Invalid choice."; exit 1;; esac
+        [ "$choice" -ge 1 ] && [ "$choice" -le "$n" ] || { echo "Choice out of range."; exit 1; }
+        DEV="${DEVS[$((choice-1))]}"
+    fi
+
+    echo
+    echo "Current content of $DEV:"
+    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINTS "$DEV"
+    if lsblk -nro MOUNTPOINTS "$DEV" | grep -q '[^[:space:]]'; then
+        echo
+        echo "WARNING: $DEV has mounted partitions. Unmount them before proceeding."
+        exit 1
+    fi
+    echo
+    echo "This operation ERASES all the content of $DEV."
+    if [ -n "$OPT_DISK" ]; then confirm="$OPT_CONFIRM"
+    else read -r -p "To confirm, type exactly $DEV : " confirm; fi
+    [ "$confirm" = "$DEV" ] || { echo "Confirmation does not match. Cancelled."; exit 1; }
+
+    # --- free label and mount point: never reuse the name of a disk that is
+    #     configured but missing right now (its fstab line would be replaced) ---
+    local i=1
+    while configured_disks | grep -qx "$BRANCHES/data$i" || mountpoint -q "$BRANCHES/data$i" \
+          || [ -n "$(ls -A "$BRANCHES/data$i" 2>/dev/null)" ]; do
+        i=$((i+1))
+    done
+    local LABEL="egos-data$i" MP="$BRANCHES/data$i"
+
+    echo "GPT partitioning on $DEV..."
+    wipefs -a "$DEV" >/dev/null
+    parted -s "$DEV" mklabel gpt
+    parted -s -a optimal "$DEV" mkpart "$LABEL" ext4 0% 100%
+    udevadm settle
+    sleep 2
+
+    local PART
+    PART=$(lsblk -lnpo NAME,TYPE "$DEV" | awk '$2=="part"{print $1; exit}')
+    [ -n "$PART" ] || { echo "No partition detected on $DEV."; exit 1; }
+
+    echo "Formatting $PART as ext4 (may take a few minutes)..."
+    mkfs.ext4 -F -L "$LABEL" -m 1 "$PART" >/dev/null
+
+    local UUID
+    UUID=$(blkid -s UUID -o value "$PART")
+    [ -n "$UUID" ] || { echo "UUID not readable."; exit 1; }
+
+    mkdir -p "$MP"
+    guard_dir "$MP"
+    fstab_del "$MP"
+    fstab_add "$(printf 'UUID=%s  %s  ext4  defaults,nofail,noatime,x-systemd.device-timeout=%s  0 2' \
+           "$UUID" "$MP" "$DISK_WAIT")"
+    systemctl daemon-reload 2>/dev/null || true
+    mount "$MP"
+
+    if ! verify_disk "$MP"; then
+        echo
+        echo "Aborting: the disk does NOT join the pool."
+        umount "$MP" 2>/dev/null || umount -l "$MP" 2>/dev/null || true
+        fstab_del "$MP"
+        systemctl daemon-reload 2>/dev/null || true
+        unguard_dir "$MP"
+        rmdir "$MP" 2>/dev/null || true
+        exit 1
+    fi
+
+    # owner = user created by setup, so Samba and the services can write
+    local U=""
+    [ -f /var/lib/setup-data.json ] && \
+        U=$(python3 -c "import json;print(json.load(open('/var/lib/setup-data.json'))['user'])" 2>/dev/null || true)
+    if [ -n "$U" ] && id "$U" >/dev/null 2>&1; then
+        chown "$U:$U" "$MP"
+    fi
+
+    local IN_POOL=1
+    if pool_sync; then
+        echo "Disk hot-attached: no service restart."
+    else
+        IN_POOL=0
+    fi
+
+    echo
+    echo "Done: $DEV -> $MP (UUID $UUID), pool $POOL"
+    do_status
+    echo
+    if [ "$IN_POOL" = 0 ]; then
+        echo "WARNING: $MP is formatted and mounted but NOT yet part of the pool."
+        echo "Retry with storage-reattach; if it still fails, reboot."
+        exit 2
+    fi
+    echo "New files now go to the data disks. Files already on the system disk stay"
+    echo "visible; to move them as well: storage-drain"
+}
+
+# --- drain: files from the system-disk branch to the data disks -------------
+# Same relative path on the pool, so no service notices. rsync writes to a
+# temporary name and renames at the end: nobody ever reads a half-copied file.
+# Files modified in the last 10 minutes are left alone (may still be written).
+# The folder tree and Immich's ".immich" marker files always stay on the system
+# disk: with every data disk removed the stack still finds its folders (Immich
+# refuses to start without the markers).
+do_drain() {
+    local -a DISKS=()
+    local d
+    for d in $(configured_disks); do mountpoint -q "$d" && DISKS+=("$d"); done
+    [ "${#DISKS[@]}" -gt 0 ] || { echo "No data disk mounted: nothing to move the files to."; exit 1; }
+    pool_mounted || { echo "Pool not mounted."; exit 1; }
+
+    local plan="$RUNDIR/drain"
+    rm -rf "$plan"; mkdir -p "$plan"
+    # greedy plan: biggest files first, each on the disk with the most room left
+    # (keeping the pool's 20G minfreespace on every disk)
+    python3 - "$LOCAL" "$plan" "${DISKS[@]}" <<'PY'
+import os, sys, time
+local, plan, disks = sys.argv[1], sys.argv[2], sys.argv[3:]
+reserve = 20 * 1024**3
+room = {}
+for d in disks:
+    st = os.statvfs(d)
+    room[d] = st.f_bavail * st.f_frsize - reserve
+cutoff = time.time() - 600
+files, recent = [], 0
+for root, dirs, names in os.walk(local):
+    for n in names:
+        if n == ".immich":
+            continue
+        p = os.path.join(root, n)
+        try:
+            st = os.lstat(p)
+        except OSError:
+            continue
+        if st.st_mtime > cutoff:
+            recent += 1
+            continue
+        files.append((st.st_size, os.path.relpath(p, local)))
+files.sort(reverse=True)
+lists = {d: [] for d in disks}
+total = {d: 0 for d in disks}
+left = []
+for size, rel in files:
+    d = max(room, key=room.get)
+    if room[d] < size:
+        left.append(rel)
+        continue
+    room[d] -= size
+    lists[d].append(rel)
+    total[d] += size
+for i, d in enumerate(disks):
+    with open(os.path.join(plan, "%d.list" % i), "wb") as fh:
+        fh.write(b"".join(r.encode() + b"\0" for r in lists[d]))
+    with open(os.path.join(plan, "%d.disk" % i), "w") as fh:
+        fh.write(d)
+    print("  %-26s %6d files, %.1f GB" % (d, len(lists[d]), total[d] / 1e9))
+print("  %d files to move; %d recent (left for now); %d do NOT fit" % (
+    sum(len(v) for v in lists.values()), recent, len(left)))
+for rel in left[:20]:
+    print("    no room: " + rel)
+PY
+    local rc=0 f
+    for f in "$plan"/*.list; do
+        [ -s "$f" ] || continue
+        d=$(cat "${f%.list}.disk")
+        echo "Moving to $d..."
+        rsync -aHAX --numeric-ids --from0 --files-from="$f" --remove-source-files \
+              --info=progress2 --human-readable "$LOCAL"/ "$d"/ || rc=1
+    done
+    rm -rf "$plan"
+    echo
+    local n
+    n=$(find "$LOCAL" -type f ! -name .immich | wc -l)
+    echo "Files still on the system disk: $n ($(du -sh "$LOCAL" | cut -f1))"
+    [ "$rc" -eq 0 ] || { echo "Some files could not be moved: see the messages above. Run it again to retry."; exit 1; }
+}
+
+# --- machine-readable state for the Cockpit page ---------------------------
+do_status_json() {
+    python3 - "$POOL" "$BRANCHES" "$FSTAB" "$JOBUNIT" "$JOBLOG" "$(sys_disk || true)" \
+              "$LOCAL" "$DEGRADED" "$HELD" "$POOL_UNIT" <<'PY'
+import json, os, re, subprocess, sys
+pool, branches, fstab, unit, joblog, sysdisk, local, degraded, held, pool_unit = sys.argv[1:11]
+
+def run(*a):
+    r = subprocess.run(a, capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+mounts = {}
+def walk(fss):
+    for f in fss:
+        mounts[f["target"]] = f
+        walk(f.get("children") or [])
+walk(json.loads(run("findmnt", "-J", "-o", "TARGET,SOURCE,FSTYPE") or '{"filesystems": []}')["filesystems"])
+
+def space(p):
+    st = os.statvfs(p)
+    return {"size": st.f_blocks * st.f_frsize, "avail": st.f_bavail * st.f_frsize,
+            "used": (st.f_blocks - st.f_bfree) * st.f_frsize}
+
+def num(p):
+    m = re.search(r"(\d+)$", p)
+    return int(m.group(1)) if m else 0
+
+in_fstab = {}
+with open(fstab, errors="replace") as fh:
+    for line in fh:
+        f = line.split()
+        if len(f) >= 2 and not f[0].startswith("#") and f[1].startswith(branches + "/data"):
+            in_fstab[f[1]] = f[0]
+paths = set(in_fstab)
+if os.path.isdir(branches):
+    paths |= {os.path.join(branches, d) for d in os.listdir(branches)
+              if d.startswith("data") and os.path.isdir(os.path.join(branches, d))}
+
+out = {"pool": {"path": pool, "mounted": False}, "branches": [], "system_disk": sysdisk}
+for mp in sorted(paths, key=num):
+    m = mounts.get(mp)
+    b = {"name": os.path.basename(mp), "path": mp, "in_fstab": mp in in_fstab,
+         "fstab_source": in_fstab.get(mp, ""), "mounted": bool(m)}
+    if m:
+        b["source"] = m["source"]
+        b["label"] = run("lsblk", "-no", "LABEL", m["source"])
+        b.update(space(mp))
+    else:
+        # files under an unmounted branch were written to the SYSTEM disk
+        b["stray"] = os.path.isdir(mp) and bool(os.listdir(mp))
+    out["branches"].append(b)
+
+pm = mounts.get(pool)
+active = None
+modes = {}
+if pm and pm.get("fstype", "").startswith("fuse"):
+    out["pool"]["mounted"] = True
+    out["pool"].update(space(pool))
+    for attr in ("user.mergerfs.branches", "user.mergerfs.srcmounts"):
+        try:
+            raw = os.getxattr(os.path.join(pool, ".mergerfs"), attr).decode()
+            for x in raw.split(":"):
+                if x:
+                    p, _, m = x.partition("=")
+                    modes[p] = (m.split(",")[0] or "RW")
+            active = set(modes)
+            break
+        except OSError:
+            pass
+for b in out["branches"]:
+    b["in_pool"] = bool(active and b["path"] in active)
+out["pool"]["service"] = run("systemctl", "is-active", pool_unit) or "inactive"
+try:
+    out["pool"]["missing"] = [os.path.basename(x) for x in open(degraded).read().split()]
+except OSError:
+    out["pool"]["missing"] = []
+out["pool"]["degraded"] = bool(out["pool"]["missing"])
+
+# system-disk branch: is anything (a file) still there?
+def first_file(top):
+    for root, dirs, names in os.walk(top):
+        if any(n != ".immich" for n in names):
+            return True
+    return False
+lst = {"path": local, "in_pool": bool(active and local in active), "mode": modes.get(local, "")}
+lst["has_files"] = os.path.isdir(local) and first_file(local)
+lst["system_free"] = space(local)["avail"] if os.path.isdir(local) else 0
+out["local"] = lst
+out["jellyfin_held"] = os.path.exists(held)
+
+stack = {}
+try:
+    user = json.load(open("/var/lib/setup-data.json"))["user"]
+    envf = "/home/%s/app/repos/.env" % user
+    stack["env"] = envf
+    with open(envf) as fh:
+        for line in fh:
+            k, _, v = line.strip().partition("=")
+            if k in ("JELLYFIN_MEDIA_LOCATION", "UPLOAD_LOCATION", "DB_DATA_LOCATION"):
+                stack[k] = v
+except (OSError, KeyError, ValueError):
+    pass
+out["stack"] = stack
+
+samba = ""
+try:
+    sect = ""
+    for line in open("/etc/samba/smb.conf", errors="replace"):
+        t = line.strip()
+        if t.startswith("["):
+            sect = t
+        elif sect == "[media]" and t.split("=")[0].strip() == "path":
+            samba = t.split("=", 1)[1].strip()
+except OSError:
+    pass
+out["samba_media_path"] = samba
+
+state = run("systemctl", "is-active", unit) or "inactive"
+out["job"] = {"unit": unit, "state": state, "running": state in ("active", "activating"),
+              "log": joblog, "has_log": os.path.exists(joblog)}
+print(json.dumps(out))
+PY
+}
+
+# --- long operations as a systemd unit: they survive a closed browser tab ---
+do_start_job() {   # $@ = a non-interactive egos-storage command line
+    case "${1:-}" in add|remove|link|remount|reattach|drain) ;;
+        *) echo "Usage: egos-storage job add|remove|reattach|drain|link <options>"; exit 1 ;; esac
+    if systemctl is-active --quiet "$JOBUNIT"; then
+        echo "A storage job is already running ($JOBUNIT)."; exit 1
+    fi
+    systemctl reset-failed "$JOBUNIT" 2>/dev/null || true
+    # HOME: docker compose (link) needs it, a transient unit has none
+    systemd-run --unit="$JOBUNIT" --collect --quiet --setenv=HOME=/root \
+        --description="EgOS storage: $*" /usr/local/sbin/egos-storage _job "$@"
+    echo "Started: $JOBUNIT (log: $JOBLOG)"
+}
+
+do_run_job() {     # inside the unit: everything goes to the log, plus an end marker
+    mkdir -p "$(dirname "$JOBLOG")"
+    echo "== $(date '+%F %T') egos-storage $*" > "$JOBLOG"
+    local rc=0
+    /usr/local/sbin/egos-storage "$@" < /dev/null >> "$JOBLOG" 2>&1 || rc=$?
+    echo "== END rc=$rc $(date '+%F %T')" >> "$JOBLOG"
+    return "$rc"
+}
+
+case "$CMD" in
+    add|link|remove|reattach|remount|drain) storage_lock 0 ;;
+esac
+case "$CMD" in
+    add)     do_add ;;
+    status)  if [ "$OPT_JSON" = 1 ]; then do_status_json; else do_status; fi ;;
+    disks)   do_disks_json ;;
+    link)    do_link ;;
+    remove)  do_remove ;;
+    reattach|remount) do_reattach ;;
+    drain)   do_drain ;;
+    job)     do_start_job "$@" ;;
+    _job)    do_run_job "$@" ;;
+    _pool)   do_pool_run ;;
+    _pool-ready) do_pool_ready ;;
+    _guard)  do_guard ;;
+    _autoreattach) do_autoreattach ;;
+    *) echo "Usage: egos-storage [add|status|disks|remove|reattach|drain|link|job] [options]"; exit 1 ;;
+esac

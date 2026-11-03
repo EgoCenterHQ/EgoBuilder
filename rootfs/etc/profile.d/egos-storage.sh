@@ -1,0 +1,7 @@
+alias storage-add='sudo /usr/local/sbin/egos-storage add'
+alias storage-status='sudo /usr/local/sbin/egos-storage status'
+alias storage-link='sudo /usr/local/sbin/egos-storage link'
+alias storage-remove='sudo /usr/local/sbin/egos-storage remove'
+alias storage-reattach='sudo /usr/local/sbin/egos-storage reattach'
+alias storage-remount='sudo /usr/local/sbin/egos-storage reattach'
+alias storage-drain='sudo /usr/local/sbin/egos-storage drain'
