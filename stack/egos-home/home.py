@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""EgOS home: pagina con i servizi del box.
+"""EgOS home: page with the services of the box.
 
-Le schede vengono dai container Docker (letti tramite un docker-socket-proxy
-in sola lettura) più una piccola lista fissa per i servizi che non sono
-container (Cockpit). Una scheda per container: la porta è quella indicata
-dalla label egos.home.port oppure la prima porta pubblicata che risponde come
-pagina web (HTTP o HTTPS). Database, BitTorrent ecc. non rispondono in HTTP e
-quindi non compaiono.
+The cards come from the Docker containers (read through a read-only
+docker-socket-proxy) plus a small fixed list for the services that are not
+containers (Cockpit). One card per container: the port is the one given by
+the egos.home.port label, otherwise the first published port that answers as
+a web page (HTTP or HTTPS). Databases, BitTorrent etc. do not answer HTTP, so
+they are not shown.
 
-Label facoltative sui container (tutte egos.home.*):
-  enable=false   nasconde il container
-  name, desc     nome e descrizione della scheda
-  port, scheme   porta e schema (http/https) da usare
-  path           percorso (predefinito /)
-  url            link completo al posto di host:porta (es. un dominio pubblico)
-  icon           nome del file in icons/ senza .svg
-  order          ordinamento (numero, predefinito 50)
+Optional container labels (all egos.home.*):
+  enable=false   hides the container
+  name, desc     card name and description
+  port, scheme   port and scheme (http/https) to use
+  path           path (default /)
+  url            full link instead of host:port (e.g. a public domain)
+  icon           file name in icons/ without .svg
+  order          sort order (number, default 50)
 
-Gira con network_mode: host, quindi prova le stesse porte del sistema.
-Solo libreria standard.
+Runs with network_mode: host, so it probes the same ports as the system.
+Standard library only.
 """
 import html
 import json
@@ -37,34 +37,34 @@ PORT = int(os.getenv("PORT", "8000"))
 ICONS = Path(__file__).with_name("icons")
 FALLBACK_HOST = os.getenv("FALLBACK_HOST", "egocenter.local")
 DOCKER_API = os.getenv("DOCKER_API", "http://127.0.0.1:23750").rstrip("/")
-PROBE_TTL = 600          # secondi: quanto vale il risultato della prova di una porta
+PROBE_TTL = 600          # seconds: how long the result of a port probe is valid
 LABEL = "egos.home."
 
-# servizi che non sono container: id, nome, descrizione, porta, schema, percorso
+# services that are not containers: id, name, description, port, scheme, path
 STATIC = [
-    ("cockpit", "Cockpit", "Amministrazione", 9090, "https", "/"),
+    ("cockpit", "Cockpit", "Administration", 9090, "https", "/"),
 ]
 
-# valori predefiniti per le immagini note (si cercano nel nome dell'immagine):
-# chiave, id/icona, nome, descrizione, ordine
+# defaults for known images (matched against the image name):
+# key, id/icon, name, description, order
 KNOWN = [
-    ("immich-server",   "immich",          "Immich",          "Foto e video",         10),
-    ("jellyfin",        "jellyfin",        "Jellyfin",        "Film, serie e musica", 20),
-    ("qbittorrent",     "qbittorrent",     "qBittorrent",     "Download torrent",     40),
-    ("torrent-web",     "torrent-web",     "Ricerca torrent", "Cerca e scarica",      41),
-    ("bentopdf",        "bentopdf",        "BentoPDF",        "Strumenti PDF",        50),
-    ("multi-scrobbler", "multi-scrobbler", "Multi-scrobbler", "Scrobbling musica",    60),
+    ("immich-server",   "immich",          "Immich",          "Photos and videos",       10),
+    ("jellyfin",        "jellyfin",        "Jellyfin",        "Movies, series and music", 20),
+    ("qbittorrent",     "qbittorrent",     "qBittorrent",     "Torrent downloads",       40),
+    ("torrent-web",     "torrent-web",     "Torrent search",  "Search and download",     41),
+    ("bentopdf",        "bentopdf",        "BentoPDF",        "PDF tools",               50),
+    ("multi-scrobbler", "multi-scrobbler", "Multi-scrobbler", "Music scrobbling",        60),
 ]
 
 HOST_RE = re.compile(r"^(\[[0-9a-fA-F:.]+\]|[A-Za-z0-9.-]+)(:\d+)?$")
 ID_RE = re.compile(r"[^a-z0-9-]+")
 
-_probe_cache = {}        # porta -> (schema o None, istante)
-_known_ports = {}        # nome container -> (porta, schema) visti quando era acceso
+_probe_cache = {}        # port -> (scheme or None, time)
+_known_ports = {}        # container name -> (port, scheme) seen while it was running
 _lock = threading.Lock()
 
 
-# --- prove di rete -----------------------------------------------------------
+# --- network probes ----------------------------------------------------------
 def is_open(port, timeout=0.4):
     try:
         with socket.create_connection(("127.0.0.1", port), timeout):
@@ -92,7 +92,7 @@ def _speaks_http(port, tls, timeout=1.0):
 
 
 def web_scheme(port):
-    """'http', 'https' o None se la porta non risponde come pagina web."""
+    """'http', 'https', or None if the port does not answer as a web page."""
     now = time.monotonic()
     with _lock:
         hit = _probe_cache.get(port)
@@ -106,7 +106,7 @@ def web_scheme(port):
 
 # --- Docker ------------------------------------------------------------------
 def docker_containers():
-    """Elenco dei container dal proxy; None se il proxy non risponde."""
+    """Container list from the proxy; None if the proxy does not answer."""
     try:
         with urllib.request.urlopen(DOCKER_API + "/containers/json?all=1", timeout=3) as r:
             return json.load(r)
@@ -146,7 +146,7 @@ def card_from_container(c):
                 port, scheme = p, lab.get("scheme") or s
                 break
     if port is None and lab.get("url") is None:
-        # un container fermo non pubblica porte: si usa quella vista quando era acceso
+        # a stopped container publishes no ports: use the one seen while it was running
         with _lock:
             seen = _known_ports.get(cname)
         if not seen:
@@ -174,7 +174,7 @@ def card_from_container(c):
 
 
 def services():
-    """(schede, docker_ok): container + servizi fissi, ordinati."""
+    """(cards, docker_ok): containers + fixed services, sorted."""
     cs = docker_containers()
     cards = []
     if cs is not None:
@@ -190,7 +190,7 @@ def services():
     return cards, cs is not None
 
 
-# --- pagina ------------------------------------------------------------------
+# --- page --------------------------------------------------------------------
 def request_host(header):
     m = HOST_RE.match(header or "")
     return m.group(1) if m else FALLBACK_HOST
@@ -199,7 +199,7 @@ def request_host(header):
 def icon_html(card):
     if (ICONS / (card["icon"] + ".svg")).is_file():
         return f'<img src="/icons/{card["icon"]}.svg" alt="" width="40" height="40">'
-    # nessuna icona: iniziale su un colore ricavato dal nome
+    # no icon: initial letter on a colour derived from the name
     hue = sum(map(ord, card["name"])) * 37 % 360
     letter = html.escape(card["name"][:1].upper() or "?")
     return (f'<svg class="auto" viewBox="0 0 40 40" width="40" height="40" aria-hidden="true">'
@@ -224,7 +224,7 @@ def render(host):
             f'<span class="desc">{html.escape(c["desc"])}</span></span>'
             f'<span class="port">{tail}</span></a>'
         )
-    warn = "" if docker_ok else '<p class="banner">Docker non raggiungibile: mostro solo i servizi fissi.</p>'
+    warn = "" if docker_ok else '<p class="banner">Docker unreachable: showing only the fixed services.</p>'
     return PAGE.format(host=html.escape(host), up=up, total=len(cards), cards="\n".join(out),
                        banner=warn, ids=html.escape(json.dumps(sorted(c["id"] for c in cards))))
 
@@ -269,7 +269,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 PAGE = """<!doctype html>
-<html lang="it">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -316,9 +316,9 @@ h1 small {{ color: var(--muted); font-weight: 400; font-size: 14px; margin-left:
 .desc {{ color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 .port {{ color: var(--muted); font: 12px ui-monospace, SFMono-Regular, Menlo, monospace; white-space: nowrap; }}
 .card.off {{ opacity: .35; filter: grayscale(1); pointer-events: none; box-shadow: none; }}
-.card.off .port::after {{ content: " · spento"; font-family: system-ui, sans-serif; }}
+.card.off .port::after {{ content: " · off"; font-family: system-ui, sans-serif; }}
 .card.warn {{ border-color: var(--warn); }}
-.card.warn .port::after {{ content: " · non sano"; color: var(--warn); font-family: system-ui, sans-serif; }}
+.card.warn .port::after {{ content: " · unhealthy"; color: var(--warn); font-family: system-ui, sans-serif; }}
 @media (max-width: 460px) {{
   .grid {{ grid-template-columns: 1fr 1fr; gap: 8px; }}
   .card {{ flex-direction: column; text-align: center; gap: 6px; padding: 12px 8px; }}
@@ -331,7 +331,7 @@ h1 small {{ color: var(--muted); font-weight: 400; font-size: 14px; margin-left:
 <main>
   <header>
     <h1>EgOS<small>{host}</small></h1>
-    <span class="count"><b id="up">{up}</b> attivi su {total}</span>
+    <span class="count"><b id="up">{up}</b> of {total} running</span>
   </header>
   {banner}
   <nav class="grid" data-ids="{ids}">
@@ -345,7 +345,7 @@ setInterval(async () => {{
   try {{
     const st = await (await fetch("/api/status", {{cache: "no-store"}})).json();
     const now = Object.keys(st.services).sort();
-    // container comparsi o spariti, o Docker tornato/perso: si ricarica la pagina
+    // containers added or removed, or Docker back/lost: reload the page
     if (JSON.stringify(now) !== JSON.stringify(ids) || (!st.docker) !== !!document.querySelector(".banner")) {{
       location.reload(); return;
     }}
@@ -368,5 +368,5 @@ setInterval(async () => {{
 """
 
 if __name__ == "__main__":
-    print(f"egos-home in ascolto su :{PORT}, Docker via {DOCKER_API}", flush=True)
+    print(f"egos-home listening on :{PORT}, Docker via {DOCKER_API}", flush=True)
     ThreadingHTTPServer(("", PORT), Handler).serve_forever()
