@@ -158,3 +158,8 @@ default user. Every stock ISO has the same root password: change it before build
 - Non-stock apps use floating tags (`latest`, `stable`, `lts`) until you pin a version; the page warns about it.
 - The Samba share is always named `media` (`egos-storage` relies on it).
 - Apps that need DNS on port 53 (Pi-hole, AdGuard) are not in the catalog: they clash with systemd-resolved.
+
+## License
+
+GPL-3.0-or-later: see [LICENSE](LICENSE). The logos of the services shown on the EgOS home page
+belong to their owners and are not covered by this license: see [NOTICE](NOTICE).

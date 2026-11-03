@@ -1,0 +1,31 @@
+EgoBuilder (EgOS)
+Copyright (C) 2026 EgoCenterHQ
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See the LICENSE file for the full text.
+
+Third-party logos
+-----------------
+The EgOS home page (egos-home) ships these SVG logos, used only to identify
+each service. They are trademarks and/or works of their respective owners and
+are NOT covered by the GPL license of this repository:
+
+  bentopdf.svg         BentoPDF
+  cockpit.svg          Cockpit Project
+  immich.svg           Immich
+  jellyfin.svg         Jellyfin Project
+  multi-scrobbler.svg  multi-scrobbler
+  qbittorrent.svg      qBittorrent Project
+
+torrent-web.svg is an original icon made for EgOS and is covered by the GPL.
+
+Third-party software
+--------------------
+The build scripts download Debian packages, and the installed system downloads
+container images (Immich, Jellyfin and the other apps) at first boot. None of
+them are included in this repository; each is distributed under its own
+license. Images built from this repository (ISO/IMG) contain Debian packages:
+whoever redistributes such an image must comply with their licenses, including
+making the corresponding source code available (https://sources.debian.org).
