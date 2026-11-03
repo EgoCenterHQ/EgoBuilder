@@ -5,7 +5,7 @@ and music: you install it from a USB stick, and it sets itself up. EgoBuilder le
 the accounts, the apps (Docker Compose containers) and the services, and builds the ISO for you.
 
 ```sh
-docker compose up -d --build        # -> http://localhost:8765
+sudo python3 egobuilder/server.py   # -> http://localhost:8765
 ```
 
 ## What EgOS gives you
@@ -36,28 +36,38 @@ are generated **on the machine** at the second boot, so they never end up in the
 
 ### Running it
 
-**Docker** (recommended; needs only docker on the host):
+**With Python** (recommended; Python 3.11+, standard library only, plus docker or podman):
 
 ```sh
-docker compose up -d --build        # start, http://localhost:8765
-docker compose logs -f              # server log
-docker compose down                 # stop; jobs stay in the egobuilder-data volume
+sudo python3 egobuilder/server.py   # or: sudo make builder   -> http://localhost:8765
 ```
+
+Each ISO build runs in a throwaway privileged `debian:trixie` container on the host network
+(`docker run --rm --privileged --network=host`, or podman): nothing to build first, and it works also where
+docker's bridge network cannot reach the internet. Starting privileged containers needs root, hence `sudo`.
+Without root or passwordless `sudo` (`python3 egobuilder/server.py`) the app works the same and, at the build
+step, shows the command to run by hand. Jobs go to `out/egobuilder/` and, with `sudo`, belong to root:
+`sudo chown -R $USER: out/egobuilder` to take them back. Stop the server with Ctrl+C.
+
+**With Docker** (the web app and live-build in one container):
+
+```sh
+docker build --network=host -t egobuilder:latest .   # build the image (again after every git pull)
+docker compose up -d                                  # start, http://localhost:8765
+docker compose logs -f                                # server log
+docker compose down                                   # stop; jobs stay in the egobuilder-data volume
+```
+
+Build the image with `docker build` as above, not with `docker compose up --build`: the image build uses the
+host network, and recent Docker Compose refuses it (`additional privileges requested: pass
+"--allow=network.host"`) with no option to allow it. `docker compose up -d` finds the image already built and
+only starts the container.
 
 The ISO is built inside the container (live-build is in the image), which needs `privileged: true` — already
 set in `compose.yaml` — because live-build mounts `/proc` and creates device nodes in its chroot. Without it the
-app still works but stops at "Prepare the tree". The container uses the host network (`network_mode: host`,
-also for the image build): on some hosts docker's bridge network cannot reach the internet and the build stops
-at the first `apt-get update`. The server listens on the host's `127.0.0.1:8765` only.
-
-**Without Docker** (Python 3.11+, standard library only):
-
-```sh
-make builder        # = python3 egobuilder/server.py
-```
-
-To build the ISO from the browser this way you need docker or podman **and** root or passwordless `sudo`;
-otherwise the page shows the command to run by hand.
+app still works but stops at "Prepare the tree". The container uses the host network (`network_mode: host`):
+on some hosts docker's bridge network cannot reach the internet and the build stops at the first
+`apt-get update`. The server listens on the host's `127.0.0.1:8765` only.
 
 | Variable | Default | |
 |---|---|---|
