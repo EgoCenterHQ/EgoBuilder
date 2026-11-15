@@ -1,12 +1,33 @@
 # EgoBuilder
 
-**A web app to build custom EgOS images.** EgOS turns a PC or mini-PC into a home server for photos, movies
-and music: you install it from a USB stick, and it sets itself up. EgoBuilder lets you choose the language,
-the accounts, the apps (Docker Compose containers) and the services, and builds the ISO for you.
+**A Debian image builder for personalized EgOS installer ISOs.** EgoBuilder is a local web app: you choose
+the language, the accounts, the services and the apps in a form, and it turns those choices into a complete
+[Debian 13 "trixie"](https://www.debian.org/releases/trixie/) build configuration (installer preseed, package
+list, system files, Docker Compose stack). Then it builds a fully unattended installer ISO for x86-64 PCs from it,
+inside a throwaway `debian:trixie` container.
+
+The installed system is [EgOS](https://github.com/EgoCenterHQ/EgOS), a home server for photos, movies and music
+that you install from a USB stick and that sets itself up. Every image is plain Debian with
+[Docker Engine](https://docs.docker.com/engine/install/debian/) and
+[Docker Compose](https://docs.docker.com/compose/); every app is a Compose service.
 
 ```sh
 sudo python3 egobuilder/server.py   # -> http://localhost:8765
 ```
+
+## Built on
+
+| Layer | What EgoBuilder uses |
+|---|---|
+| Base system | [Debian 13 "trixie"](https://www.debian.org/releases/trixie/) (`main contrib non-free non-free-firmware` + `trixie-security`), systemd, systemd-networkd |
+| Installer | the Debian installer inside a [live-build](https://live-team.pages.debian.net/live-manual/) hybrid ISO (BIOS + UEFI, USB or DVD), fully automated by a generated [preseed](https://www.debian.org/releases/trixie/amd64/apb.en.html) |
+| Build toolchain | live-build in a throwaway, privileged [`debian:trixie`](https://hub.docker.com/_/debian) container run by Docker or [Podman](https://podman.io/); the web app is Python 3.11+ standard library only |
+| Containers | Docker Engine + Docker Compose v2 from Docker's official apt repository: key fingerprint-checked, `.deb`s shipped in the ISO, repository kept on the box for updates |
+| Apps | Compose services from the catalog (or your own); their images are pulled from the upstream registries (Docker Hub, GHCR, …) on the box at the second boot, not stored in the ISO |
+| Storage, admin, sharing | [mergerfs](https://github.com/trapexit/mergerfs), [Cockpit](https://cockpit-project.org/), [Samba](https://www.samba.org/) + wsdd2, Avahi, OpenSSH: all Debian packages |
+
+Nothing is remastered or patched: each ISO is built from the Debian archive, and the installed box stays a
+normal Debian server (`apt` for the system and Docker, `docker compose` for the apps).
 
 ## What EgOS gives you
 
@@ -78,6 +99,34 @@ on some hosts docker's bridge network cannot reach the internet and the build st
 The server answers only to `localhost`/`127.0.0.1` (DNS rebinding) and accepts POSTs only as JSON (no CSRF).
 Whoever can reach it can start privileged builds: do not publish it beyond your machine.
 
+## How the custom ISO is built
+
+EgoBuilder does not modify an existing ISO: every build makes a new Debian installer image from the Debian
+archive, with your settings baked in.
+
+1. **Profile**: the web form produces a JSON profile, which is checked as you type.
+2. **Generate**: `egobuilder/generator.py` copies this repository's tree into the job folder and rewrites only
+   the files the profile touches. Every edit has a checked anchor, so a mismatch stops the build:
+   - **Debian installer preseed** (`preseed.cfg`): locale, keyboard, time zone, hostname and domain,
+     partitioning recipe, root password as a SHA-512 hash (or root locked), power off or reboot at the end, and
+     which services are enabled;
+   - **live-build package list**: your extra Debian packages, plus `unattended-upgrades` if you chose automatic
+     security updates;
+   - **system files**: SSH keys and `sshd` settings, Docker log limit (`/etc/docker/daemon.json`), Avahi name,
+     setup Wi-Fi, apt auto-upgrades;
+   - **Docker Compose stack**: `docker-compose.yml`, the `.env` template and the first-deploy script, assembled
+     from the chosen catalog apps.
+
+   Then `tools/check.sh` checks the generated tree.
+3. **Build**: a privileged, throwaway `debian:trixie` container (`--rm --privileged --network=host`) installs
+   live-build and runs `build/amd64/EgOS4-amd64.sh` on the generated tree, mounted read-only. The script runs
+   `lb config` (trixie, amd64, Debian installer), verifies Docker's apt key fingerprint, downloads the Docker
+   Engine `.deb`s from `download.docker.com`, and `lb build` produces the hybrid ISO. Only the ISO is copied
+   back. The log is streamed live to the page.
+4. **Output**: `out/egobuilder/<job>/` holds `iso/egos-<version>-amd64.iso`, `build.log`, and `tree/`, the
+   generated tree (also offered as `.tar.gz` in the Summary step). `make iso-amd64` in that tree rebuilds the same
+   image by hand.
+
 ## Installing the ISO
 
 1. Write `egos-<version>-amd64.iso` to a USB stick and boot the PC from it (BIOS or UEFI).
@@ -103,7 +152,7 @@ the EgOS user; Immich uses the email instead of the username.
 
 **Status:** EgOS 4.3.0, in development. For the home network only: no firewall yet.
 
-## How it works
+## Repository layout
 
 The files EgOS adds to Debian live in this repo and are edited in place:
 
