@@ -83,7 +83,8 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(HTML.replace('<form', f'<p style="color:#f66">{error}</p><form', 1).encode('utf-8'))
             return
         # setup-webapp.sh polls for this file: it must appear complete, never half written
-        with open('/var/lib/setup-data.json.tmp', 'w') as f:
+        # 0600: it holds the user password in clear text
+        with open(os.open('/var/lib/setup-data.json.tmp', os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'w') as f:
             json.dump(result, f)
         os.replace('/var/lib/setup-data.json.tmp', '/var/lib/setup-data.json')
         self.send_response(200)
