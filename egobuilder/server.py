@@ -121,7 +121,9 @@ def build_command(job, manual=False):
                      "--name", f"egobuilder-{job['id']}",
                      "-v", f"{tree}:/src:ro,Z", "-v", f"{iso}:/out:Z",
                      "docker.io/library/debian:trixie", "bash", "-c",
-                     BUILD_SH.format(uid=os.getuid(), gid=os.getgid())]
+                     # under `sudo python3 server.py` the ISO goes to the user who ran sudo
+                     BUILD_SH.format(uid=os.environ.get("SUDO_UID", os.getuid()),
+                                     gid=os.environ.get("SUDO_GID", os.getgid()))]
 
 
 def shell_command(job):
@@ -349,7 +351,8 @@ class Handler(BaseHTTPRequestHandler):
                 if m.group(2) is None:
                     return self.send(200, public_job(job))
                 if m.group(2) == "/log":
-                    off = int(parse_qs(u.query).get("offset", ["0"])[0])
+                    off = parse_qs(u.query).get("offset", ["0"])[0]
+                    off = int(off) if off.isdigit() else 0
                     text, size = read_log(jid, off)
                     return self.send(200, {"text": text, "offset": size, "status": job["status"]})
                 if m.group(2) == "/tree.tar.gz":
@@ -404,14 +407,18 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, f.read(), CT.get(os.path.splitext(path)[1], "application/octet-stream"))
 
     def send_tree(self, job):
-        tmp = job_path(job["id"], "tree.tar.gz")
+        # streamed: no temp file shared by concurrent downloads. HTTP/1.0 without
+        # Content-Length: the end of the body is the end of the connection
         name = f"egos-{job['profile_name']}-{job['id']}"
-        with tarfile.open(tmp, "w:gz") as t:
-            t.add(job_path(job["id"], "tree"), arcname=name)
-        try:
-            self.send_file(tmp, name + ".tar.gz", "application/gzip")
-        finally:
-            os.remove(tmp)
+        tree = job_path(job["id"], "tree")
+        if not os.path.isdir(tree):
+            raise FileNotFoundError(tree)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}.tar.gz"')
+        self.end_headers()
+        with tarfile.open(fileobj=self.wfile, mode="w|gz") as t:
+            t.add(tree, arcname=name)
 
 
 ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"} | \

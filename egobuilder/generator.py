@@ -275,6 +275,9 @@ def validate(profile, catalog=None):
         E("setup.ssid", "SSID: letters, digits, spaces (max 32)")
     if not (8 <= len(st["wifi_password"]) <= 63) or not st["wifi_password"].isprintable():
         E("setup.wifi_password", "setup Wi-Fi password: 8-63 characters")
+    elif any(ch in st["wifi_password"] for ch in '$`\\"'):
+        # setup-webapp.sh writes it in an unquoted heredoc: the shell would expand these
+        E("setup.wifi_password", "setup Wi-Fi password: no $ ` \\ or \" characters")
     if not re.match(r"^[A-Z]{2}$", st["wifi_country"]):
         E("setup.wifi_country", "Wi-Fi country: 2 uppercase letters (e.g. IT)")
     if not RE_HOST.match(st["mdns_name"]) or st["mdns_name"] == s["hostname"]:

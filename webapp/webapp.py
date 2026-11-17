@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 import json
+import os
+import pwd
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import parse_qs
 
@@ -38,6 +41,23 @@ HTML = """<!DOCTYPE html>
 </html>
 """
 
+def invalid(r):
+    """Error message, or None. The values reach useradd, chpasswd ("user:pass" per
+    line) and the stack .env (single-quoted), so reject what would break them."""
+    if not re.fullmatch(r'[a-z_][a-z0-9_-]{0,31}', r['user']):
+        return 'Username: lowercase letters, digits, "_" or "-", starting with a letter.'
+    try:
+        pwd.getpwnam(r['user'])
+        return 'That username is already a system account: choose another.'
+    except KeyError:
+        pass
+    if not re.fullmatch(r'[^@\s]+@[^@\s]+\.[^@\s]+', r['email']):
+        return 'Invalid email.'
+    if not r['password'] or not r['password'].isprintable() or "'" in r['password']:
+        return 'Password: required, no single quotes or control characters.'
+    return None
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args): pass
 
@@ -51,16 +71,25 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get('Content-Length', 0))
         data = parse_qs(self.rfile.read(length).decode())
         result = {
-            'email': data.get('email', [''])[0],
-            'user': data.get('user', [''])[0],
+            'email': data.get('email', [''])[0].strip(),
+            'user': data.get('user', [''])[0].strip(),
             'password': data.get('password', [''])[0]
         }
-        with open('/var/lib/setup-data.json', 'w') as f:
+        error = invalid(result)
+        if error:
+            self.send_response(400)
+            self.send_header('Content-type', 'text/html')
+            self.end_headers()
+            self.wfile.write(HTML.replace('<form', f'<p style="color:#f66">{error}</p><form', 1).encode('utf-8'))
+            return
+        # setup-webapp.sh polls for this file: it must appear complete, never half written
+        with open('/var/lib/setup-data.json.tmp', 'w') as f:
             json.dump(result, f)
+        os.replace('/var/lib/setup-data.json.tmp', '/var/lib/setup-data.json')
         self.send_response(200)
         self.send_header('Content-type', 'text/html')
         self.end_headers()
         self.wfile.write(b'<html><body style="background:#1a1a1a;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;"><div style="text-align:center;"><h1>Setup Complete</h1><p>The system will now reboot and deploy the stack.</p></div></body></html>')
 
-httpd = HTTPServer(('0.0.0.0', 80), Handler)
-httpd.serve_forever()
+if __name__ == '__main__':
+    HTTPServer(('0.0.0.0', 80), Handler).serve_forever()

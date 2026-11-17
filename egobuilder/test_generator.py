@@ -197,6 +197,20 @@ class Validation(unittest.TestCase):
         self.assertTrue({"system.hostname", "system.domain", "accounts.user", "accounts.email",
                          "accounts.password"} <= self.fields(p))
 
+    def test_wifi_password_shell_chars(self):
+        for pw in ("pa$$word12", "pass`id`word", "back\\slash1", 'quo"te1234'):
+            self.assertIn("setup.wifi_password", self.fields(profile(setup__wifi_password=pw)))
+        self.assertNotIn("setup.wifi_password", self.fields(profile(setup__wifi_password="Good-pass_9!")))
+
+    def test_firstboot_webapp_input(self):
+        sys.path.insert(0, os.path.join(REPO, "webapp"))
+        import webapp
+        ok = {"user": "mario", "email": "m@example.com", "password": "pa:ss word"}
+        self.assertIsNone(webapp.invalid(ok))
+        for k, v in (("user", "root"), ("user", ""), ("user", "../x"), ("email", "x"),
+                     ("password", ""), ("password", "x\nroot:pwned"), ("password", "it's")):
+            self.assertIsNotNone(webapp.invalid(ok | {k: v}), (k, v))
+
     def test_custom_app(self):
         p = profile()
         p["custom_apps"] = [{"id": "whoami", "name": "Whoami",
